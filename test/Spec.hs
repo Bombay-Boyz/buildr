@@ -61,11 +61,20 @@ genDiagnosticPayload = do
   flag <- oneof [pure Nothing, Just <$> elements ["-Wunused-imports", "-Wall"]]
   pure (DiagnosticPayload sev code sp msgs hints flag)
 
+-- | Generator for ModuleNode.
+genModuleNode :: Gen ModuleNode
+genModuleNode = ModuleNode <$> elements ["Core.A", "Core.B", "Core.C"] <*> pure "src/A.hs" <*> arbitrary
+
+-- | Generator for GraphEdge.
+genGraphEdge :: Gen GraphEdge
+genGraphEdge = GraphEdge <$> elements [Nothing, Just "Core.A", Just "Core.B"] <*> elements ["Core.A", "Core.B", "Core.C"] <*> arbitrary
+
 -- | Generator for EventPayload variants.
 genPayload :: Gen EventPayload
 genPayload = oneof
   [ PayloadBuildStarted <$> pure "0.1.0" <*> pure "3.16.1.0" <*> pure "9.10.3"
   , pure (PayloadPlanReady [PlanUnit "unit-1" "pkg-a" "1.0" "lib" StyleLocal [] Nothing])
+  , PayloadGraphKnown <$> pure "unit-1" <*> listOf genModuleNode <*> listOf genGraphEdge
   , pure (PayloadUnitStarted "unit-1")
   , pure (PayloadUnitCompleted "unit-1" 0)
   , pure (PayloadUnitFailed "unit-1" 1 (Just "cabal.log"))
@@ -153,6 +162,22 @@ prop_diagnosticJsonRoundTrip :: Property
 prop_diagnosticJsonRoundTrip = forAll genDiagnosticPayload $ \diag ->
   let jsonTxt = TE.decodeUtf8 (BSL.toStrict (Aeson.encode diag))
   in parseGhcDiagnosticJson jsonTxt == Just diag
+
+-- | Property 11: Kahn's topological sort ensures dependencies precede dependents (Standard 4.2).
+prop_kahnTopologicalSortValid :: Property
+prop_kahnTopologicalSortValid =
+  let m1 = ModuleNode "ModA" "src/ModA.hs" False
+      m2 = ModuleNode "ModB" "src/ModB.hs" False
+      m3 = ModuleNode "ModC" "src/ModC.hs" False
+      nodes = [m1, m2, m3]
+      edges = [ GraphEdge (Just "ModA") "ModB" False
+              , GraphEdge (Just "ModB") "ModC" False
+              ]
+      sorted = kahnTopologicalSort nodes edges
+      idxOf x = case filter (\(_, n) -> n == x) (zip [0 :: Int ..] sorted) of
+        ((i, _):_) -> Just i
+        []         -> Nothing
+  in property (idxOf "ModC" < idxOf "ModB" && idxOf "ModB" < idxOf "ModA")
 
 -- | Tests Plan JSON parser functionality on edge cases and live plan.json.
 runPlanTests :: IO Bool
@@ -295,8 +320,17 @@ runBoundaryTests = do
                   && T.isInfixOf "• Help: Add instance" formattedDiag
                   && T.isInfixOf "https://errors.haskell.org/messages/GHC-39999 (derived)" formattedDiag
 
+  -- Upfront module graph discovery tests (§8.2, §10, §14)
+  (srcNodes, srcEdges) <- discoverUnitGraph "src"
+  let srcGraphOk = length srcNodes >= 10 && not (null srcEdges)
+      srcKahn = kahnTopologicalSort srcNodes srcEdges
+      kahnValid = length srcKahn == length srcNodes
+      modHeaderOk = parseModuleHeader "module Test.Mod (foo) where\nfoo = 1" == Just "Test.Mod"
+      modImportsOk = parseImports "import qualified Data.Map as Map\nimport {-# SOURCE #-} Test.Sub\n"
+                  == [("Data.Map", False), ("Test.Sub", True)]
+
       boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone && ciGroupOk && t1Ok && c1Ok && c2Ok
-                && diagParsedOk && diagFormatOk
+                && diagParsedOk && diagFormatOk && srcGraphOk && kahnValid && modHeaderOk && modImportsOk
   if boundaryOk
     then do
       putStrLn "  Boundary outlier tests: PASS"
@@ -360,10 +394,11 @@ main = do
   res8 <- quickCheckResult (withNumTests 100 prop_summaryBlockCountsMatchModel)
   res9 <- quickCheckResult (withNumTests 100 prop_historyCacheJsonRoundTrip)
   res10 <- quickCheckResult (withNumTests 100 prop_diagnosticJsonRoundTrip)
+  res11 <- quickCheckResult (withNumTests 50 prop_kahnTopologicalSortValid)
 
   let allPassed = bOk && planOk && ipcOk && goldenOk && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
-                      && isSuccess res7 && isSuccess res8 && isSuccess res9 && isSuccess res10
+                      && isSuccess res7 && isSuccess res8 && isSuccess res9 && isSuccess res10 && isSuccess res11
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

@@ -11,7 +11,7 @@ import Buildr.Core
 import Control.Concurrent (MVar, forkIO, killThread, modifyMVar_, newMVar, readMVar, threadDelay)
 import Control.Concurrent.Async (async, wait)
 import Control.Exception (bracket, bracket_)
-import Control.Monad (forever, unless, when)
+import Control.Monad (filterM, forever, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
 import Data.Int (Int64)
@@ -24,6 +24,7 @@ import Options.Applicative
 import System.Directory
   ( canonicalizePath
   , createDirectoryIfMissing
+  , doesDirectoryExist
   , doesFileExist
   , findExecutable
   , getCurrentDirectory
@@ -187,12 +188,18 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
         Right units -> do
           let planEvent = mkEvent 1 0 SrcPlan ValueReported (PayloadPlanReady units)
               m0 = applyEvent initialModel planEvent
+
+          -- Discover upfront module dependency graph for local units (§8.2, §10, §14)
+          graphEvents <- discoverLocalUnitGraphs units
+          let m1 = foldEvents m0 graphEvents
+
           case recordFile of
             Just path -> do
               createDirectoryIfMissing True (takeDirectory path)
               BS.appendFile path (encodeEventLine planEvent <> "\n")
+              mapM_ (\ge -> BS.appendFile path (encodeEventLine ge <> "\n")) graphEvents
             Nothing -> pure ()
-          modelVar <- newMVar m0
+          modelVar <- newMVar m1
 
           -- Setup persistent history
           histPath <- defaultHistoryPath
@@ -273,6 +280,31 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
                 exitWith code
   where
     cleanupServer _ = pure ()
+
+-- | Upfront discovery of module dependency graphs for local Cabal units (§8.2, §10, §14).
+discoverLocalUnitGraphs :: [PlanUnit] -> IO [Event]
+discoverLocalUnitGraphs units = do
+  let localUnits = filter (\u -> puStyle u == StyleLocal) units
+  fmap concat (mapM discoverForUnit localUnits)
+  where
+    discoverForUnit u = do
+      let candidateDirs = case puComponent u of
+            "lib"              -> ["src", "lib"]
+            "exe:buildr"       -> ["app"]
+            "exe:buildr-ghc"   -> ["wrapper"]
+            "test:buildr-test" -> ["test"]
+            comp
+              | "exe:" `T.isPrefixOf` comp  -> [T.unpack (T.drop 4 comp), "app"]
+              | "test:" `T.isPrefixOf` comp -> [T.unpack (T.drop 5 comp), "test"]
+              | otherwise                   -> ["src"]
+      dirsExist <- filterM doesDirectoryExist candidateDirs
+      case dirsExist of
+        (d:_) -> do
+          (mods, edges) <- discoverUnitGraph d
+          if null mods
+            then pure []
+            else pure [mkEvent 2 0 SrcGraph ValueReported (PayloadGraphKnown (puId u) mods edges)]
+        [] -> pure []
 
 -- | Concurrently reads Cabal stdout, streaming to console in plain view and updating lifecycle state.
 readCabalStdout :: Handle -> MVar BuildModel -> MVar HistoryCache -> Maybe FilePath -> ViewMode -> IO ()

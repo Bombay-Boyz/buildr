@@ -150,7 +150,8 @@ instance FromJSON ModuleNode
 
 -- | A directed edge in the module dependency graph.
 data GraphEdge = GraphEdge
-  { geTarget         :: !Text
+  { geSource         :: !(Maybe Text)
+  , geTarget         :: !Text
   , geIsSourceImport :: !Bool
   } deriving (Eq, Show, Generic)
 

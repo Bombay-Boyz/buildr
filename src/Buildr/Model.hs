@@ -125,17 +125,37 @@ applyEvent model ev = case eventPayload ev of
 
   PayloadGraphKnown uid mods edges ->
     updateUnitByPkgOrId uid (\u ->
-      let edgeMap = foldl (\acc e -> Set.insert (geTarget e) acc) Set.empty edges
+      let edgeMapFor mName =
+            foldl (\acc e ->
+                     case geSource e of
+                       Nothing -> if geTarget e /= mName then Set.insert (geTarget e) acc else acc
+                       Just s  -> if s == mName then Set.insert (geTarget e) acc else acc
+                  ) Set.empty edges
           addMod acc m =
-            Map.insert (mnName m) (ModuleInfo (mnName m) uid ModPending edgeMap False Map.empty) acc
+            case Map.lookup (mnName m) acc of
+              Just existing ->
+                Map.insert (mnName m) (existing { miDependencies = edgeMapFor (mnName m) }) acc
+              Nothing ->
+                Map.insert (mnName m) (ModuleInfo (mnName m) uid ModPending (edgeMapFor (mnName m)) False Map.empty) acc
       in u { uiModules = foldl addMod (uiModules u) mods }
       ) model
 
   PayloadUnitStarted uid ->
-    updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitBuilding (eventTimestamp ev) }) model
+    updateUnitByPkgOrId uid (\u ->
+      case uiStatus u of
+        UnitFailed _ _  -> u
+        UnitStopped     -> u
+        UnitCompleted _ -> u
+        _               -> u { uiStatus = UnitBuilding (eventTimestamp ev) }
+      ) model
 
   PayloadUnitCompleted uid code ->
-    updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitCompleted code }) model
+    updateUnitByPkgOrId uid (\u ->
+      case uiStatus u of
+        UnitFailed _ _ -> u
+        UnitStopped    -> u
+        _              -> u { uiStatus = UnitCompleted code }
+      ) model
 
   PayloadUnitFailed uid code logPath ->
     let m1 = updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitFailed code logPath }) model

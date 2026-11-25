@@ -40,6 +40,7 @@ library
         Buildr.Error
         Buildr.Event
         Buildr.Grammar
+        Buildr.Graph
         Buildr.History
         Buildr.Ipc
         Buildr.Model
