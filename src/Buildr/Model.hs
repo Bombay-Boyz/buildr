@@ -81,16 +81,18 @@ data BuildModel = BuildModel
   , bmOutcome      :: !(Maybe BuildOutcome)
   , bmBusySlots    :: !Int
   , bmTotalSlots   :: !Int
+  , bmDiagnostics  :: ![DiagnosticPayload]
   } deriving (Eq, Show)
 
 -- | Initializes an empty pure build model.
 initialModel :: BuildModel
 initialModel = BuildModel
-  { bmUnits      = Map.empty
-  , bmCompleted  = False
-  , bmOutcome    = Nothing
-  , bmBusySlots  = 0
-  , bmTotalSlots = 1
+  { bmUnits        = Map.empty
+  , bmCompleted    = False
+  , bmOutcome      = Nothing
+  , bmBusySlots    = 0
+  , bmTotalSlots   = 1
+  , bmDiagnostics  = []
   }
 
 -- | Updates a unit inside the model map safely by exact unit id or matching package name.
@@ -193,6 +195,9 @@ applyEvent model ev = case eventPayload ev of
              in u { uiModules = Map.insert modName newM mods }
            Just m  -> u { uiModules = Map.insert modName (m { miStatus = ModSkipped reas }) mods }
       ) model
+
+  PayloadDiagnostic _mu diag ->
+    model { bmDiagnostics = if diag `elem` bmDiagnostics model then bmDiagnostics model else diag : bmDiagnostics model }
 
   PayloadSlotsChanged busy total ->
     model { bmBusySlots = busy, bmTotalSlots = total }

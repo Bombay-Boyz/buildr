@@ -23,10 +23,12 @@ import Control.Exception (bracket)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
+import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import System.Directory (doesFileExist, getTemporaryDirectory)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>))
@@ -40,6 +42,25 @@ genSource = elements [SrcCabal, SrcGhc, SrcPlan, SrcGraph, SrcHistory, SrcBuildr
 genValueKind :: Gen ValueKind
 genValueKind = elements [ValueObserved, ValueReported, ValueDerived, ValueEstimate]
 
+-- | Generator for valid DiagnosticSeverity.
+genSeverity :: Gen DiagnosticSeverity
+genSeverity = elements [SeverityError, SeverityWarning, SeverityInfo]
+
+-- | Generator for SourceSpan.
+genSpan :: Gen SourceSpan
+genSpan = SourceSpan <$> elements ["src/A.hs", "src/B.hs"] <*> choose (1, 1000) <*> choose (1, 100) <*> choose (1, 1000) <*> choose (1, 100)
+
+-- | Generator for DiagnosticPayload.
+genDiagnosticPayload :: Gen DiagnosticPayload
+genDiagnosticPayload = do
+  sev <- genSeverity
+  code <- oneof [pure Nothing, Just <$> choose (1000, 99999)]
+  sp <- genSpan
+  msgs <- listOf1 (elements ["syntax error", "type mismatch", "not in scope"])
+  hints <- listOf (elements ["add import", "use let binding"])
+  flag <- oneof [pure Nothing, Just <$> elements ["-Wunused-imports", "-Wall"]]
+  pure (DiagnosticPayload sev code sp msgs hints flag)
+
 -- | Generator for EventPayload variants.
 genPayload :: Gen EventPayload
 genPayload = oneof
@@ -50,6 +71,7 @@ genPayload = oneof
   , pure (PayloadUnitFailed "unit-1" 1 (Just "cabal.log"))
   , pure (PayloadUnitStopped "unit-1")
   , pure (PayloadSlotsChanged 2 4)
+  , PayloadDiagnostic <$> elements [Nothing, Just "unit-1"] <*> genDiagnosticPayload
   , pure (PayloadBuildDone BuildSuccess (BuildCounts 10 0 0 0 0) 5000000000)
   ]
 
@@ -125,6 +147,12 @@ prop_historyCacheJsonRoundTrip rawList = not (null rawList) ==>
       key = HistoryKey "p" "u" "M" "9.10" "3.16" "-O1"
       cache = foldr (\d acc -> insertTiming key d 1024 acc) emptyHistoryCache ds
   in Aeson.decode (Aeson.encode cache) == Just cache
+
+-- | Property 10: DiagnosticPayload JSON round-trip via parseGhcDiagnosticJson (§13).
+prop_diagnosticJsonRoundTrip :: Property
+prop_diagnosticJsonRoundTrip = forAll genDiagnosticPayload $ \diag ->
+  let jsonTxt = TE.decodeUtf8 (BSL.toStrict (Aeson.encode diag))
+  in parseGhcDiagnosticJson jsonTxt == Just diag
 
 -- | Tests Plan JSON parser functionality on edge cases and live plan.json.
 runPlanTests :: IO Bool
@@ -248,7 +276,27 @@ runBoundaryTests = do
         Just (PayloadUnitCompleted p 0) -> p == "text-2.1.3"
         _ -> False
 
+      -- Stream recogniser & formatter tests for GHC JSON diagnostics (§13, §22)
+      ghcDiagJson = "{\"version\":\"1.0\",\"ghcVersion\":\"ghc-9.10.3\",\"span\":{\"file\":\"src/Core.hs\",\"start\":{\"line\":10,\"column\":5},\"end\":{\"line\":10,\"column\":12}},\"severity\":\"Error\",\"code\":39999,\"message\":[\"No instance for `Num String'\"],\"hints\":[\"Add instance\"],\"flag\":\"-Wcompat\"}"
+      parsedDiag = parseGhcDiagnosticJson ghcDiagJson
+      diagParsedOk = case parsedDiag of
+        Just d -> diagSeverity d == SeverityError
+               && diagCode d == Just 39999
+               && spanFile (diagSpan d) == "src/Core.hs"
+               && spanStartLine (diagSpan d) == 10
+               && spanStartCol (diagSpan d) == 5
+               && diagMessage d == ["No instance for `Num String'"]
+               && diagHints d == ["Add instance"]
+               && diagFlag d == Just "-Wcompat"
+        Nothing -> False
+      formattedDiag = maybe "" formatDiagnostic parsedDiag
+      diagFormatOk = T.isInfixOf "src/Core.hs:10:5: error: [GHC-39999] [-Wcompat]" formattedDiag
+                  && T.isInfixOf "No instance for `Num String'" formattedDiag
+                  && T.isInfixOf "• Help: Add instance" formattedDiag
+                  && T.isInfixOf "https://errors.haskell.org/messages/GHC-39999 (derived)" formattedDiag
+
       boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone && ciGroupOk && t1Ok && c1Ok && c2Ok
+                && diagParsedOk && diagFormatOk
   if boundaryOk
     then do
       putStrLn "  Boundary outlier tests: PASS"
@@ -311,10 +359,11 @@ main = do
   res7 <- quickCheckResult (withNumTests 50 prop_rasikaThemeContrast)
   res8 <- quickCheckResult (withNumTests 100 prop_summaryBlockCountsMatchModel)
   res9 <- quickCheckResult (withNumTests 100 prop_historyCacheJsonRoundTrip)
+  res10 <- quickCheckResult (withNumTests 100 prop_diagnosticJsonRoundTrip)
 
   let allPassed = bOk && planOk && ipcOk && goldenOk && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
-                      && isSuccess res7 && isSuccess res8 && isSuccess res9
+                      && isSuccess res7 && isSuccess res8 && isSuccess res9 && isSuccess res10
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

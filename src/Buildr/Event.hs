@@ -32,18 +32,23 @@ module Buildr.Event
   , mkEvent
   , encodeEventLine
   , decodeEventLine
-    -- * Stream Recognisers (§22 G4, G5)
+    -- * Stream Recognisers & Diagnostic Formatting (§13, §22 G4, G5)
   , parseTimingLine
   , parseCabalLifecycleLine
+  , parseGhcDiagnosticJson
+  , formatDiagnostic
   ) where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?), (.=), object, withObject, encode, decodeStrict)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
+import Data.Foldable (toList)
 import Data.Int (Int64)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import GHC.Generics (Generic)
 import Text.Read (readMaybe)
 
@@ -174,7 +179,7 @@ instance ToJSON DiagnosticSeverity where
     SeverityInfo    -> "info"
 
 instance FromJSON DiagnosticSeverity where
-  parseJSON = Aeson.withText "DiagnosticSeverity" $ \case
+  parseJSON = Aeson.withText "DiagnosticSeverity" $ \t -> case T.toLower t of
     "error"   -> pure SeverityError
     "warning" -> pure SeverityWarning
     "info"    -> pure SeverityInfo
@@ -410,3 +415,114 @@ parseCabalLifecycleLine rawLine =
        _ -> Nothing
   where
     cleanPkg p = T.dropWhileEnd (== '.') (T.takeWhile (/= '(') p)
+
+-- | Intermediate representation for point coordinates in GHC JSON diagnostics.
+data RawGhcPoint = RawGhcPoint
+  { rgpLine   :: !(Maybe Int)
+  , rgpColumn :: !(Maybe Int)
+  } deriving (Eq, Show, Generic)
+
+instance FromJSON RawGhcPoint where
+  parseJSON = withObject "RawGhcPoint" $ \o ->
+    RawGhcPoint <$> o .:? "line" <*> o .:? "column"
+
+-- | Intermediate representation for source spans in GHC JSON diagnostics.
+data RawGhcSpan = RawGhcSpan
+  { rgsFile  :: !(Maybe FilePath)
+  , rgsStart :: !(Maybe RawGhcPoint)
+  , rgsEnd   :: !(Maybe RawGhcPoint)
+  } deriving (Eq, Show, Generic)
+
+instance FromJSON RawGhcSpan where
+  parseJSON = withObject "RawGhcSpan" $ \o ->
+    RawGhcSpan <$> o .:? "file" <*> o .:? "start" <*> o .:? "end"
+
+-- | Raw GHC compiler diagnostic payload emitted under @-fdiagnostics-as-json@.
+data RawGhcDiagnostic = RawGhcDiagnostic
+  { rgdSeverity :: !DiagnosticSeverity
+  , rgdCode     :: !(Maybe Int)
+  , rgdSpan     :: !(Maybe RawGhcSpan)
+  , rgdMessage  :: ![Text]
+  , rgdHints    :: !(Maybe [Text])
+  , rgdFlag     :: !(Maybe Text)
+  } deriving (Eq, Show, Generic)
+
+instance FromJSON RawGhcDiagnostic where
+  parseJSON = withObject "RawGhcDiagnostic" $ \o -> do
+    sev <- o .: "severity"
+    code <- o .:? "code"
+    mSpan <- o .:? "span"
+    msgVal <- o .: "message"
+    msgs <- case msgVal of
+      Aeson.Array arr -> mapM parseJSON (toList arr)
+      Aeson.String s  -> pure [s]
+      _               -> pure []
+    mHints <- o .:? "hints"
+    mFlag <- o .:? "flag"
+    pure RawGhcDiagnostic
+      { rgdSeverity = sev
+      , rgdCode     = code
+      , rgdSpan     = mSpan
+      , rgdMessage  = msgs
+      , rgdHints    = mHints
+      , rgdFlag     = mFlag
+      }
+
+-- | Purely translates a raw GHC JSON diagnostic into the canonical domain 'DiagnosticPayload'.
+rawGhcToPayload :: RawGhcDiagnostic -> DiagnosticPayload
+rawGhcToPayload raw =
+  let (f, sLine, sCol, eLine, eCol) = case rgdSpan raw of
+        Nothing -> ("<unknown>", 1, 1, 1, 1)
+        Just sp ->
+          let file = fromMaybe "<unknown>" (rgsFile sp)
+              (sl, sc) = case rgsStart sp of
+                Just pt -> (fromMaybe 1 (rgpLine pt), fromMaybe 1 (rgpColumn pt))
+                Nothing -> (1, 1)
+              (el, ec) = case rgsEnd sp of
+                Just pt -> (fromMaybe sl (rgpLine pt), fromMaybe sc (rgpColumn pt))
+                Nothing -> (sl, sc)
+          in (file, sl, sc, el, ec)
+      hints = fromMaybe [] (rgdHints raw)
+  in DiagnosticPayload
+       { diagSeverity = rgdSeverity raw
+       , diagCode     = rgdCode raw
+       , diagSpan     = SourceSpan f sLine sCol eLine eCol
+       , diagMessage  = rgdMessage raw
+       , diagHints    = hints
+       , diagFlag     = rgdFlag raw
+       }
+
+-- | Purely parses a raw GHC JSON diagnostic line emitted under @-fdiagnostics-as-json@ (§13, §22).
+-- Accepts both official GHC 9.10 JSON format and buildr's internal 'DiagnosticPayload' JSON.
+parseGhcDiagnosticJson :: Text -> Maybe DiagnosticPayload
+parseGhcDiagnosticJson txt =
+  let bs = TE.encodeUtf8 (T.strip txt)
+  in case decodeStrict bs :: Maybe DiagnosticPayload of
+       Just dp -> Just dp
+       Nothing -> case decodeStrict bs :: Maybe RawGhcDiagnostic of
+         Just raw -> Just (rawGhcToPayload raw)
+         Nothing  -> Nothing
+
+-- | Formats a GHC diagnostic according to Visual Grammar v1 and §13:
+-- Header with clickable location, severity, error code, warning flag, verbatim message lines, and derived doc links.
+formatDiagnostic :: DiagnosticPayload -> Text
+formatDiagnostic diag =
+  let span' = diagSpan diag
+      loc = T.pack (spanFile span') <> ":" <> T.pack (show (spanStartLine span')) <> ":" <> T.pack (show (spanStartCol span'))
+      sevStr = case diagSeverity diag of
+        SeverityError   -> "error"
+        SeverityWarning -> "warning"
+        SeverityInfo    -> "info"
+      codeStr = case diagCode diag of
+        Just c  -> " [GHC-" <> T.pack (show c) <> "]"
+        Nothing -> ""
+      flagStr = case diagFlag diag of
+        Just f  -> " [" <> f <> "]"
+        Nothing -> ""
+      header = loc <> ": " <> sevStr <> ":" <> codeStr <> flagStr
+      msgLines = map ("    " <>) (diagMessage diag)
+      hintLines = map (\h -> "    • Help: " <> h) (diagHints diag)
+      docLine = case diagCode diag of
+        Just c  -> ["    • Documentation: https://errors.haskell.org/messages/GHC-" <> T.pack (show c) <> " (derived)"]
+        Nothing -> []
+  in T.unlines ([header] <> msgLines <> hintLines <> docLine)

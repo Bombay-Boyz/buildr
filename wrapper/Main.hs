@@ -17,7 +17,9 @@ import Buildr.Core
   ( EventPayload (..)
   , EventSource (..)
   , ValueKind (..)
+  , formatDiagnostic
   , mkEvent
+  , parseGhcDiagnosticJson
   , parseTimingLine
   , sendIpcEvent
   )
@@ -140,14 +142,23 @@ runGhcCapture mSocket unitId modName args = case mSocket of
       eof <- hIsEOF hErr
       unless eof $ do
         line <- TIO.hGetLine hErr
-        TIO.hPutStrLn stderr line
-        hFlush stderr
-        case parseTimingLine line of
-          Just (phase, ms, alloc) -> do
+        case parseGhcDiagnosticJson line of
+          Just diag -> do
             nowNs <- getMonotonicTimeNSec
-            let phaseEv = mkEvent 0 (fromIntegral nowNs :: Int64) SrcGhc ValueReported
-                            (PayloadModulePhase unitId modName phase ms alloc)
-            _ <- sendIpcEvent sockPath phaseEv
-            pure ()
-          Nothing -> pure ()
+            let diagEv = mkEvent 0 (fromIntegral nowNs :: Int64) SrcGhc ValueReported
+                           (PayloadDiagnostic (Just unitId) diag)
+            _ <- sendIpcEvent sockPath diagEv
+            TIO.hPutStr stderr (formatDiagnostic diag)
+            hFlush stderr
+          Nothing -> do
+            TIO.hPutStrLn stderr line
+            hFlush stderr
+            case parseTimingLine line of
+              Just (phase, ms, alloc) -> do
+                nowNs <- getMonotonicTimeNSec
+                let phaseEv = mkEvent 0 (fromIntegral nowNs :: Int64) SrcGhc ValueReported
+                                (PayloadModulePhase unitId modName phase ms alloc)
+                _ <- sendIpcEvent sockPath phaseEv
+                pure ()
+              Nothing -> pure ()
         teeStderr sockPath hErr

@@ -27,7 +27,7 @@ module Buildr.View
   , computeCriticalPath
   ) where
 
-import Buildr.Event (BuildOutcome (..))
+import Buildr.Event (BuildOutcome (..), formatDiagnostic)
 import Buildr.Grammar
 import Buildr.Model
 import Data.Int (Int64)
@@ -160,7 +160,11 @@ renderPlainView model =
                                     <> " " <> miName m <> " ("
                                     <> stateName (statusToVisual (miStatus m)) <> ")") mods
         in "Unit " <> uiId u <> ":\n" <> T.unlines modLines
-  in T.concat (map renderUnitPlain units)
+      diags = bmDiagnostics model
+      diagSection = if null diags
+                      then ""
+                      else "\n--- Diagnostics ---\n" <> T.concat (map formatDiagnostic (reverse diags))
+  in T.concat (map renderUnitPlain units) <> diagSection
 
 -- | Renders the Plain view tailored for GitHub Actions with collapsible groups.
 renderPlainViewCi :: BuildModel -> Text
