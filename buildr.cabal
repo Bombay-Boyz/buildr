@@ -41,7 +41,10 @@ library
         Buildr.Event
         Buildr.Grammar
         Buildr.History
+        Buildr.Ipc
         Buildr.Model
+        Buildr.Plan
+        Buildr.Theme
         Buildr.View
     hs-source-dirs:   src
     build-depends:
@@ -68,6 +71,7 @@ executable buildr
         base,
         buildr,
         bytestring,
+        containers,
         directory,
         filepath,
         optparse-applicative,
@@ -83,7 +87,9 @@ executable buildr-ghc
         base,
         buildr,
         network,
-        process
+        process,
+        text,
+        time
 
 test-suite buildr-test
     import:           warnings
@@ -96,5 +102,7 @@ test-suite buildr-test
         buildr,
         aeson,
         containers,
+        directory,
+        filepath,
         QuickCheck >=2.14 && <2.20,
         text

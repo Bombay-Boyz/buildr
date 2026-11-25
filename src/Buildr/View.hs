@@ -6,8 +6,8 @@
 -- Maintainer  : 259497327+Bombay-Boyz@users.noreply.github.com
 -- Stability   : experimental
 --
--- Pure functions from BuildModel to formatted frames. Every view is total,
--- stack-safe, and independent of IO effects.
+-- Pure functions from BuildModel to formatted frames satisfying §11, §12, and §16.
+-- Every view is total, stack-safe, and independent of IO effects.
 module Buildr.View
   ( -- * View Modes
     ViewMode (..)
@@ -18,12 +18,22 @@ module Buildr.View
   , renderZenView
   , renderMosaicView
   , renderPlainView
+  , renderPlainViewCi
   , renderLinearView
+    -- * Summary Block (§16)
+  , renderSummaryBlock
+  , computeHeaviestModule
+  , computeSlowestModule
+  , computeCriticalPath
   ) where
 
+import Buildr.Event (BuildOutcome (..))
 import Buildr.Grammar
 import Buildr.Model
+import Data.Int (Int64)
+import Data.List (maximumBy)
 import qualified Data.Map.Strict as Map
+import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -77,7 +87,7 @@ renderUnitSummary u =
   in "  " <> uiPackage u <> " " <> bar <> " "
        <> T.pack (show doneMods) <> "/" <> T.pack (show totalMods) <> " [" <> statusLabel <> "]"
 
--- | Renders the single-line Zen view.
+-- | Renders the single-line Zen view (§12.2).
 renderZenView :: BuildModel -> Text
 renderZenView model =
   let counts = countModulesByStatus model
@@ -91,7 +101,7 @@ renderZenView model =
                     else "compiling"
   in "buildr " <> bar <> " " <> T.pack (show doneCount) <> "/" <> T.pack (show totalMods) <> " · " <> statusStr
 
--- | Renders the Mosaic view (compact character cell per module).
+-- | Renders the Mosaic view (compact character cell per module, §12.3).
 renderMosaicView :: BuildModel -> Text
 renderMosaicView model =
   let allMods = concatMap (Map.elems . uiModules) (Map.elems (bmUnits model))
@@ -106,7 +116,7 @@ renderMosaicView model =
       cells = map cellForMod allMods
   in "buildr mosaic: [" <> T.pack cells <> "]"
 
--- | Renders the Plain / CI view suitable for non-interactive log files.
+-- | Renders the Plain / CI view suitable for non-interactive log files (§12.4).
 renderPlainView :: BuildModel -> Text
 renderPlainView model =
   let units = Map.elems (bmUnits model)
@@ -118,7 +128,21 @@ renderPlainView model =
         in "Unit " <> uiId u <> ":\n" <> T.unlines modLines
   in T.concat (map renderUnitPlain units)
 
--- | Renders the Linear accessible view designed for screen readers.
+-- | Renders the Plain view tailored for GitHub Actions with collapsible groups.
+renderPlainViewCi :: BuildModel -> Text
+renderPlainViewCi model =
+  let units = Map.elems (bmUnits model)
+      renderUnitCi u =
+        let mods = Map.elems (uiModules u)
+            modLines = map (\m -> "  " <> T.singleton (stateGlyph (statusToVisual (miStatus m)))
+                                    <> " " <> miName m <> " ("
+                                    <> stateName (statusToVisual (miStatus m)) <> ")") mods
+        in "::group::Unit " <> uiPackage u <> " (" <> uiId u <> ")\n"
+             <> T.unlines modLines
+             <> "::endgroup::\n"
+  in T.concat (map renderUnitCi units)
+
+-- | Renders the Linear accessible view designed for screen readers (§12.5).
 renderLinearView :: BuildModel -> Text
 renderLinearView model =
   let counts = countModulesByStatus model
@@ -147,3 +171,118 @@ statusToVisual = \case
   ModFailed _    -> VisFailed
   ModBlocked _   -> VisBlocked
   ModNotReached  -> VisNotReached
+
+-- | Finds the module with the highest memory allocation, returning its name, allocation, and dominant phase.
+computeHeaviestModule :: BuildModel -> Maybe (Text, Int64, Text)
+computeHeaviestModule model =
+  let allMods = concatMap (Map.elems . uiModules) (Map.elems (bmUnits model))
+      doneMods = [ m | m <- allMods, isModuleDone m ]
+      extractAlloc m =
+        let phases = Map.toList (miPhases m)
+            totalAlloc = case miStatus m of ModDone _ a -> a; _ -> 0
+            domPhase = if null phases
+                         then "compile"
+                         else fst (maximumBy (comparing (snd . snd)) phases)
+        in (miName m, totalAlloc, domPhase)
+  in if null doneMods
+       then Nothing
+       else Just (maximumBy (comparing (\(_, a, _) -> a)) (map extractAlloc doneMods))
+
+-- | Finds the module that took the longest time to compile.
+computeSlowestModule :: BuildModel -> Maybe (Text, Int64)
+computeSlowestModule model =
+  let allMods = concatMap (Map.elems . uiModules) (Map.elems (bmUnits model))
+      doneDurations = [ (miName m, d) | m <- allMods, ModDone d _ <- [miStatus m] ]
+  in if null doneDurations
+       then Nothing
+       else Just (maximumBy (comparing snd) doneDurations)
+
+-- | Approximates the critical path (longest chain by module count and dependencies).
+computeCriticalPath :: BuildModel -> [Text]
+computeCriticalPath model =
+  let allMods = concatMap (Map.elems . uiModules) (Map.elems (bmUnits model))
+      modMap = Map.fromList [ (miName m, m) | m <- allMods ]
+      longestFrom name visited =
+        if name `elem` visited
+          then []
+          else case Map.lookup name modMap of
+                 Nothing -> [name]
+                 Just _ ->
+                   let deps = [ d | d <- Map.keys (Map.filter (\other -> name `elem` miDependencies other) modMap) ]
+                   in if null deps
+                        then [name]
+                        else name : maximumBy (comparing length) (map (\d -> longestFrom d (name : visited)) deps)
+      roots = [ miName m | m <- allMods, null (miDependencies m) ]
+  in if null roots
+       then map miName (take 5 allMods)
+       else maximumBy (comparing length) (map (\r -> longestFrom r []) roots)
+
+-- | Formats a human-readable duration in milliseconds to seconds / minutes.
+formatDurationMs :: Int64 -> Text
+formatDurationMs ms
+  | ms < 1000 = T.pack (show ms) <> "ms"
+  | otherwise =
+      let secs = fromIntegral ms / 1000.0 :: Double
+          rounded = (fromIntegral (round (secs * 10.0) :: Int) / 10.0) :: Double
+      in T.pack (show rounded) <> "s"
+
+-- | Formats a memory allocation in bytes to KB/MB/GB.
+formatBytes :: Int64 -> Text
+formatBytes b
+  | b < 1024 = T.pack (show b) <> " B"
+  | b < 1048576 = T.pack (show (b `div` 1024)) <> " KB"
+  | otherwise = T.pack (show (b `div` 1048576)) <> " MB"
+
+-- | Canonical Summary Block specified in §16.
+-- Always printed at the end of a build run in all views except Zen.
+renderSummaryBlock :: BuildModel -> Int64 -> Text
+renderSummaryBlock model wallTimeNs =
+  let wallMs = wallTimeNs `div` 1000000
+      counts = countModulesByStatus model
+      doneCount    = Map.findWithDefault 0 "done" counts
+      skippedCount = Map.findWithDefault 0 "skipped" counts
+      failedCount  = Map.findWithDefault 0 "failed" counts
+      blockedCount = Map.findWithDefault 0 "blocked" counts
+      notReached   = Map.findWithDefault 0 "not_reached" counts
+
+      outcomeLabel = case bmOutcome model of
+        Just BuildSuccess   -> "SUCCESS"
+        Just BuildFailed    -> "FAILED"
+        Just BuildCancelled -> "CANCELLED"
+        Nothing -> if failedCount > 0 then "FAILED" else "SUCCESS"
+
+      countsLine = "Modules: " <> T.pack (show doneCount) <> " done, "
+                              <> T.pack (show skippedCount) <> " skipped, "
+                              <> T.pack (show failedCount) <> " failed, "
+                              <> T.pack (show blockedCount) <> " blocked, "
+                              <> T.pack (show notReached) <> " not reached"
+
+      heaviestInfo = case computeHeaviestModule model of
+        Just (name, alloc, phase) ->
+          "Heaviest module: " <> name <> " (" <> formatBytes alloc <> " in " <> phase <> ")"
+        Nothing -> "Heaviest module: none recorded"
+
+      slowestInfo = case computeSlowestModule model of
+        Just (name, dur) ->
+          "Slowest module:  " <> name <> " (" <> formatDurationMs dur <> ")"
+        Nothing -> "Slowest module:  none recorded"
+
+      critPath = computeCriticalPath model
+      critPathLine = if null critPath
+                       then ""
+                       else "Critical path:   " <> T.intercalate " -> " (take 6 critPath)
+
+      nextStep = if failedCount > 0
+                   then "Next steps: Run 'buildr build --keep-going' or check compiler diagnostics above."
+                   else "Build completed cleanly."
+  in T.unlines
+       [ "================================================================================"
+       , "=== buildr Outcome: " <> outcomeLabel <> " (Wall time: " <> formatDurationMs wallMs <> ") ==="
+       , "================================================================================"
+       , countsLine
+       , heaviestInfo
+       , slowestInfo
+       , critPathLine
+       , nextStep
+       , "================================================================================"
+       ]

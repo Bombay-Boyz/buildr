@@ -11,7 +11,10 @@ module Buildr.Core
   , module Buildr.Event
   , module Buildr.Grammar
   , module Buildr.History
+  , module Buildr.Ipc
   , module Buildr.Model
+  , module Buildr.Plan
+  , module Buildr.Theme
   , module Buildr.View
     -- * Versioning
   , buildrVersion
@@ -21,7 +24,10 @@ import Buildr.Error
 import Buildr.Event
 import Buildr.Grammar
 import Buildr.History
+import Buildr.Ipc
 import Buildr.Model
+import Buildr.Plan
+import Buildr.Theme
 import Buildr.View
 import Data.Text (Text)
 

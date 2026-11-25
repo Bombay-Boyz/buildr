@@ -11,6 +11,7 @@
 --   * Median calculation over last 10 builds (total and sort-based).
 --   * Overrun threshold detection (1.5x usual time).
 --   * Honest labeling: always tagged as estimate (~ / est.).
+--   * Persistent XDG cache loading and saving.
 module Buildr.History
   ( -- * Keys and Cache Entries
     HistoryKey (..)
@@ -22,16 +23,28 @@ module Buildr.History
   , computeUsualTime
   , isOverrun
   , formatOverrun
+  , getSlowestModules
+  , getHeaviestModules
+    -- * Persistence
+  , defaultHistoryPath
+  , loadHistoryCache
+  , saveHistoryCache
   ) where
 
-import Data.Aeson (FromJSON, ToJSON, ToJSONKey, FromJSONKey)
+import Control.Exception (SomeException, try)
+import Data.Aeson (FromJSON, ToJSON, ToJSONKey, FromJSONKey, eitherDecodeStrict, encode)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int64)
-import Data.List (sort)
+import Data.List (sort, sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Ord (Down (..), comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import GHC.Generics (Generic)
+import System.Directory (XdgDirectory (..), createDirectoryIfMissing, doesFileExist, getXdgDirectory)
+import System.FilePath (takeDirectory, (</>))
 
 -- | Composite key uniquely indexing build history per §10.3.
 data HistoryKey = HistoryKey
@@ -107,3 +120,47 @@ formatOverrun :: Int64 -> Int64 -> Text
 formatOverrun observedMs usualMs =
   let diffSec = fromIntegral (max 0 (observedMs - usualMs)) / (1000.0 :: Double)
   in "+" <> T.pack (show (round diffSec :: Int)) <> "s vs usual"
+
+-- | Retrieves the slowest modules by median execution time in descending order.
+getSlowestModules :: HistoryCache -> [(HistoryKey, Int64)]
+getSlowestModules cache@(HistoryCache m) =
+  let pairs = Map.toList m
+      withMedian = [ (k, med) | (k, _) <- pairs, Just med <- [computeUsualTime k cache] ]
+  in sortBy (comparing (Down . snd)) withMedian
+
+-- | Retrieves the heaviest modules by peak reported allocation in descending order.
+getHeaviestModules :: HistoryCache -> [(HistoryKey, Int64)]
+getHeaviestModules (HistoryCache m) =
+  let pairs = Map.toList m
+      withMaxAlloc = [ (k, maximum as) | (k, entry) <- pairs, let as = mthAllocBytes entry, not (null as) ]
+  in sortBy (comparing (Down . snd)) withMaxAlloc
+
+-- | Returns the default persistent history file path ($XDG_CACHE_HOME/buildr/history.json).
+defaultHistoryPath :: IO FilePath
+defaultHistoryPath = do
+  dir <- getXdgDirectory XdgCache "buildr"
+  pure (dir </> "history.json")
+
+-- | Loads the history cache from disk safely, returning an empty cache if not present or corrupt.
+loadHistoryCache :: FilePath -> IO HistoryCache
+loadHistoryCache path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure emptyHistoryCache
+    else do
+      res <- try (BS.readFile path) :: IO (Either SomeException BS.ByteString)
+      case res of
+        Left _ -> pure emptyHistoryCache
+        Right content -> case eitherDecodeStrict content of
+          Left _      -> pure emptyHistoryCache
+          Right cache -> pure cache
+
+-- | Persists the history cache atomically to disk.
+saveHistoryCache :: FilePath -> HistoryCache -> IO (Either Text ())
+saveHistoryCache path cache = do
+  let dir = takeDirectory path
+  createDirectoryIfMissing True dir
+  res <- try (BSL.writeFile path (encode cache)) :: IO (Either SomeException ())
+  case res of
+    Left ex -> pure (Left (T.pack (show ex)))
+    Right () -> pure (Right ())

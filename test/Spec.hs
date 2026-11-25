@@ -1,6 +1,6 @@
 -- |
 -- Module      : Main
--- Description : Comprehensive property and boundary test suite for buildr.
+-- Description : Comprehensive property, IPC, theme, and plan test suite for buildr.
 -- Copyright   : (c) bombay boyz, 2026
 -- License     : MIT
 -- Maintainer  : 259497327+Bombay-Boyz@users.noreply.github.com
@@ -10,15 +10,23 @@
 --   * §10.1 Pure model state machine invariants (QuickCheck)
 --   * §9 Event Protocol v1 serialization round-tripping
 --   * §11 Visual Grammar 20-cell progress bar bounds and resolution
---   * §10.3 History cache median computation and overrun detection
---   * Boundary outliers (empty plan, single module, zero width, large sequences)
+--   * §10.3 History cache median computation, overrun detection, and persistence
+--   * §17 Theme contrast ratios against WCAG 2.1 (minimum 4.5:1)
+--   * §16 Summary block consistency with pure model
+--   * §8.2 Unix domain socket IPC streaming and client/server transport
+--   * Cabal plan.json decoding and validation
 module Main (main) where
 
 import Buildr.Core
+import Control.Concurrent (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (bracket)
+import qualified Data.Aeson as Aeson
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
+import System.Directory (doesFileExist, getTemporaryDirectory)
 import System.Exit (exitFailure, exitSuccess)
+import System.FilePath ((</>))
 import Test.QuickCheck
 
 -- | Generator for valid Event Protocol v1 event sources.
@@ -85,12 +93,98 @@ prop_historyMedianBounded rawList = not (null rawList) ==>
        Nothing -> False
        Just med -> med >= minimum ds && med <= maximum ds
 
--- | Property 6: Overrun detection correctly triggers when observed > 1.5x usual (for realistic build timings up to 24 hours).
+-- | Property 6: Overrun detection correctly triggers when observed > 1.5x usual.
 prop_overrunDetection :: Property
 prop_overrunDetection = forAll (choose (10, 86400000 :: Int64)) $ \usual ->
   let normal = usual
       slow = (usual * 16) `div` 10
   in not (isOverrun normal usual) && isOverrun slow usual
+
+-- | Property 7: Rasika theme strictly satisfies WCAG 2.1 (minimum 4.5:1 contrast) per §17.
+prop_rasikaThemeContrast :: Property
+prop_rasikaThemeContrast = property $
+  let checks = checkThemeContrast rasikaTheme
+  in all (\(_, _, pass) -> pass) checks
+
+-- | Property 8: Summary block always contains valid counts matching model status totals.
+prop_summaryBlockCountsMatchModel :: Property
+prop_summaryBlockCountsMatchModel = forAll (listOf genEvent) $ \evs ->
+  let model = foldEvents initialModel evs
+      summary = renderSummaryBlock model 1000000000
+      counts = countModulesByStatus model
+      doneCount = Map.findWithDefault 0 "done" counts
+  in T.isInfixOf (T.pack (show doneCount) <> " done") summary
+
+-- | Property 9: HistoryCache JSON serialization round-trips losslessly.
+prop_historyCacheJsonRoundTrip :: [Positive Int64] -> Property
+prop_historyCacheJsonRoundTrip rawList = not (null rawList) ==>
+  let ds = map getPositive (take 10 rawList)
+      key = HistoryKey "p" "u" "M" "9.10" "3.16" "-O1"
+      cache = foldr (\d acc -> insertTiming key d 1024 acc) emptyHistoryCache ds
+  in Aeson.decode (Aeson.encode cache) == Just cache
+
+-- | Tests Plan JSON parser functionality on edge cases and live plan.json.
+runPlanTests :: IO Bool
+runPlanTests = do
+  putStrLn "Running Cabal plan.json tests..."
+  let emptyPlanResult = parsePlanJson "{\"install-plan\": []}"
+      emptyOk = emptyPlanResult == Right []
+
+      malformedResult = parsePlanJson "{ not valid json }"
+      malformedOk = case malformedResult of
+        Left (PlanJsonParseFailure _ _) -> True
+        _                               -> False
+
+  liveExists <- doesFileExist defaultPlanPath
+  liveOk <- if liveExists
+    then do
+      res <- loadPlanJson defaultPlanPath
+      case res of
+        Right units -> do
+          putStrLn ("  Loaded " <> show (length units) <> " units from " <> defaultPlanPath)
+          pure (not (null units))
+        Left err -> do
+          putStrLn ("  Failed to load plan: " <> show err)
+          pure False
+    else pure True
+
+  let allPlanOk = emptyOk && malformedOk && liveOk
+  if allPlanOk
+    then putStrLn "  Plan parser tests: PASS"
+    else putStrLn "  Plan parser tests: FAIL"
+  pure allPlanOk
+
+-- | Tests Unix domain socket IPC streaming.
+runIpcTests :: IO Bool
+runIpcTests = do
+  putStrLn "Running Unix domain socket IPC integration tests..."
+  tmpDir <- getTemporaryDirectory
+  let sockPath = tmpDir </> "buildr-test-ipc.sock"
+  recvVar <- newEmptyMVar :: IO (MVar Event)
+
+  let testEvent = mkEvent 42 123456789 SrcGhc ValueReported (PayloadModuleFinished "u1" "TestModule")
+  res <- bracket (startIpcServer sockPath (putMVar recvVar)) cleanupServer $ \case
+    Left err -> do
+      putStrLn ("  Failed to bind server socket: " <> show err)
+      pure False
+    Right serverHandle -> do
+      sendRes <- sendIpcEvent sockPath testEvent
+      case sendRes of
+        Left err -> do
+          putStrLn ("  Failed to send IPC event: " <> show err)
+          stopIpcServer serverHandle
+          pure False
+        Right () -> do
+          receivedEvent <- takeMVar recvVar
+          stopIpcServer serverHandle
+          let match = receivedEvent == testEvent
+          if match
+            then putStrLn "  IPC transport test: PASS"
+            else putStrLn "  IPC transport test: FAIL (Event mismatch)"
+          pure match
+  pure res
+  where
+    cleanupServer _ = pure ()
 
 -- | Boundary test cases.
 runBoundaryTests :: IO Bool
@@ -131,7 +225,11 @@ runBoundaryTests = do
           Nothing -> False
         Nothing -> False
 
-      boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone
+      -- CI plain rendering check (§12.4)
+      ciOut = renderPlainViewCi builtModel
+      ciGroupOk = T.isInfixOf "::group::Unit" ciOut && T.isInfixOf "::endgroup::" ciOut
+
+      boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone && ciGroupOk
   if boundaryOk
     then do
       putStrLn "  Boundary outlier tests: PASS"
@@ -146,6 +244,8 @@ main = do
   putStrLn "  buildr Verification & Invariant Suite (QuickCheck)"
   putStrLn "=========================================================="
   bOk <- runBoundaryTests
+  planOk <- runPlanTests
+  ipcOk <- runIpcTests
 
   res1 <- quickCheckResult (withNumTests 100 prop_eventJsonRoundTrip)
   res2 <- quickCheckResult (withNumTests 200 prop_barWidthRespectsBounds)
@@ -153,12 +253,16 @@ main = do
   res4 <- quickCheckResult (withNumTests 100 prop_foldDeterminism)
   res5 <- quickCheckResult (withNumTests 100 prop_historyMedianBounded)
   res6 <- quickCheckResult (withNumTests 100 prop_overrunDetection)
+  res7 <- quickCheckResult (withNumTests 50 prop_rasikaThemeContrast)
+  res8 <- quickCheckResult (withNumTests 100 prop_summaryBlockCountsMatchModel)
+  res9 <- quickCheckResult (withNumTests 100 prop_historyCacheJsonRoundTrip)
 
-  let allPassed = bOk && isSuccess res1 && isSuccess res2 && isSuccess res3
+  let allPassed = bOk && planOk && ipcOk && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
+                      && isSuccess res7 && isSuccess res8 && isSuccess res9
   if allPassed
     then do
-      putStrLn "\nAll QuickCheck properties and boundary invariants PASSED."
+      putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."
       exitSuccess
     else do
       putStrLn "\nVerification suite FAILED."
