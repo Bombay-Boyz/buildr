@@ -16,7 +16,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import GHC.Clock (getMonotonicTimeNSec)
@@ -30,10 +30,21 @@ import System.Directory
   , getCurrentDirectory
   , getTemporaryDirectory
   )
-import System.Environment (getEnvironment)
+import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (Handle, hFlush, hIsEOF, stdout)
+import System.IO
+  ( BufferMode (..)
+  , Handle
+  , hFlush
+  , hIsEOF
+  , hIsTerminalDevice
+  , hReady
+  , hSetBuffering
+  , hSetEcho
+  , stdin
+  , stdout
+  )
 import System.Process
   ( CreateProcess (..)
   , StdStream (..)
@@ -243,8 +254,19 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
               TIO.putStrLn (describeError (BuildrIpcError ipcErr))
               exitFailure
             Right serverHandle -> do
+              isTty <- hIsTerminalDevice stdin
+              tuiVar <- newMVar (TuiState viewMode True 0 False)
+
               -- 3. Run live display loop in background
-              renderThread <- forkIO (liveRenderLoop modelVar viewMode)
+              renderThread <- forkIO (liveRenderLoop modelVar tuiVar)
+
+              -- 3b. Interactive keyboard input loop if attached to a terminal (§12.6)
+              mInputThread <- if isTty && viewMode /= ViewPlain
+                then do
+                  hSetBuffering stdin NoBuffering
+                  hSetEcho stdin False
+                  Just <$> forkIO (interactiveInputLoop tuiVar modelVar)
+                else pure Nothing
 
               -- 4. Invoke cabal build passing wrapper and BUILDR_SOCKET
               curEnv <- getEnvironment
@@ -267,7 +289,13 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
                 wait cabalWorker
                 endNs <- getMonotonicTimeNSec
 
-                -- 5. Finalize rendering
+                -- 5. Finalize rendering & restore terminal
+                case mInputThread of
+                  Just inTid -> do
+                    killThread inTid
+                    hSetEcho stdin True
+                    hSetBuffering stdin LineBuffering
+                  Nothing -> pure ()
                 killThread renderThread
                 stopIpcServer serverHandle
                 finalModel <- readMVar modelVar
@@ -339,14 +367,91 @@ onIpcEvent modelVar cacheVar maybeLogPath ev = do
       BS.appendFile path (encodeEventLine ev <> "\n")
     Nothing   -> pure ()
 
+-- | State record tracking interactive TTY view settings and navigation (§12.6).
+data TuiState = TuiState
+  { tsViewMode     :: !ViewMode
+  , tsShowWarnings :: !Bool
+  , tsSelectedRow  :: !Int
+  , tsDetached     :: !Bool
+  } deriving (Eq, Show)
+
+-- | Keyboard event parsed from raw terminal input.
+data KeyEvent
+  = KeyChar !Char
+  | KeyUp
+  | KeyDown
+  | KeyEnter
+  | KeyUnknown
+  deriving (Eq, Show)
+
+-- | Safely reads a raw terminal key event without partial indexing.
+readKey :: IO KeyEvent
+readKey = do
+  c <- getChar
+  if c == '\ESC'
+    then do
+      ready1 <- hReady stdin
+      if ready1
+        then do
+          c1 <- getChar
+          if c1 == '['
+            then do
+              ready2 <- hReady stdin
+              if ready2
+                then do
+                  c2 <- getChar
+                  case c2 of
+                    'A' -> pure KeyUp
+                    'B' -> pure KeyDown
+                    _   -> pure KeyUnknown
+                else pure KeyUnknown
+            else pure KeyUnknown
+        else pure (KeyChar '\ESC')
+    else if c == '\n' || c == '\r'
+           then pure KeyEnter
+           else pure (KeyChar c)
+
+-- | Interactive key event loop (§12.6: g/m/z view, t warnings, ↑/↓ navigation, e editor, q detach).
+interactiveInputLoop :: MVar TuiState -> MVar BuildModel -> IO ()
+interactiveInputLoop tuiVar modelVar = forever $ do
+  key <- readKey
+  case key of
+    KeyChar 'g' -> modifyMVar_ tuiVar (\s -> pure s { tsViewMode = ViewGraph })
+    KeyChar 'm' -> modifyMVar_ tuiVar (\s -> pure s { tsViewMode = ViewMosaic })
+    KeyChar 'z' -> modifyMVar_ tuiVar (\s -> pure s { tsViewMode = ViewZen })
+    KeyChar 't' -> modifyMVar_ tuiVar (\s -> pure s { tsShowWarnings = not (tsShowWarnings s) })
+    KeyChar 'q' -> do
+      modifyMVar_ tuiVar (\s -> pure s { tsDetached = True })
+      putStr "\nbuildr: detached display. Compilation continuing in background...\n"
+      hFlush stdout
+    KeyUp       -> modifyMVar_ tuiVar (\s -> pure s { tsSelectedRow = max 0 (tsSelectedRow s - 1) })
+    KeyDown     -> modifyMVar_ tuiVar (\s -> pure s { tsSelectedRow = tsSelectedRow s + 1 })
+    KeyChar 'e' -> do
+      m <- readMVar modelVar
+      let diags = bmDiagnostics m
+      case diags of
+        (d:_) -> do
+          let sp = diagSpan d
+              file = spanFile sp
+              line = spanStartLine sp
+          mEd <- lookupEnv "EDITOR"
+          let editor = fromMaybe "nano" mEd
+          _ <- createProcess (proc editor ["+" <> show line, file])
+          pure ()
+        [] -> pure ()
+    _ -> pure ()
+
 -- | Periodically refreshes terminal display with latest model state.
-liveRenderLoop :: MVar BuildModel -> ViewMode -> IO ()
-liveRenderLoop modelVar viewMode = forever $ do
+liveRenderLoop :: MVar BuildModel -> MVar TuiState -> IO ()
+liveRenderLoop modelVar tuiVar = forever $ do
   threadDelay 150000 -- ~6.6 fps refresh rate
-  m <- readMVar modelVar
-  putStr "\r\ESC[K"
-  TIO.putStr (renderView viewMode m)
-  hFlush stdout
+  tState <- readMVar tuiVar
+  unless (tsDetached tState) $ do
+    m <- readMVar modelVar
+    putStr "\r\ESC[K"
+    let mSel = if tsViewMode tState == ViewGraph then Just (tsSelectedRow tState) else Nothing
+    TIO.putStr (renderViewSelected (tsViewMode tState) mSel m)
+    hFlush stdout
 
 -- | Watch mode rebuilding targets on change (§18).
 runWatch :: [String] -> IO ()

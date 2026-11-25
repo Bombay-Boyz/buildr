@@ -13,8 +13,10 @@ module Buildr.View
     ViewMode (..)
     -- * View Dispatcher
   , renderView
+  , renderViewSelected
     -- * Specific Renderers
   , renderGraphView
+  , renderGraphViewSelected
   , renderZenView
   , renderMosaicView
   , renderPlainView
@@ -48,27 +50,34 @@ data ViewMode
 
 -- | Top-level view rendering function dispatching purely by mode.
 renderView :: ViewMode -> BuildModel -> Text
-renderView = \case
-  ViewGraph  -> renderGraphView
-  ViewZen    -> renderZenView
-  ViewMosaic -> renderMosaicView
-  ViewPlain  -> renderPlainView
-  ViewLinear -> renderLinearView
+renderView mode = renderViewSelected mode Nothing
 
--- | Formats the default Graph Frontier view (§12.1).
-renderGraphView :: BuildModel -> Text
-renderGraphView model =
+-- | Formats view with an optional selected row index for keyboard navigation (§12.6).
+renderViewSelected :: ViewMode -> Maybe Int -> BuildModel -> Text
+renderViewSelected mode mSel model = case mode of
+  ViewGraph  -> renderGraphViewSelected mSel model
+  ViewZen    -> renderZenView model
+  ViewMosaic -> renderMosaicView model
+  ViewPlain  -> renderPlainView model
+  ViewLinear -> renderLinearView model
+
+-- | Formats the default Graph Frontier view with optional keyboard selection cursor (§12.1, §12.6).
+renderGraphViewSelected :: Maybe Int -> BuildModel -> Text
+renderGraphViewSelected mSel model =
   let units = Map.elems (bmUnits model)
       totalUnits = length units
       isActive u = case uiStatus u of
         UnitPlanned -> not (Map.null (uiModules u))
         _           -> True
       (activeUnits, inactiveUnits) = partition isActive units
-      activeLines = concatMap renderActiveUnit activeUnits
+      (activeLines, _) = foldl renderUnitWithCursor ([], 0) activeUnits
       foldedLine = if null inactiveUnits
                      then []
                      else ["  ▸ " <> T.pack (show (length inactiveUnits)) <> " dependencies planned/waiting"]
       footer = "Overall: " <> renderOverallBar model
+      helpLine = case mSel of
+        Just idx -> ["  [Keys: ↑/↓ select (row " <> T.pack (show idx) <> ") | g/m/z view | t warnings | e edit | q detach]"]
+        Nothing  -> ["  [Keys: g/m/z view | t warnings | ↑/↓ select | q detach]"]
   in T.unlines
        ( [ "=== buildr: Graph Frontier (Units: " <> T.pack (show totalUnits)
              <> " | Slots: " <> T.pack (show (bmBusySlots model)) <> "/"
@@ -77,33 +86,38 @@ renderGraphView model =
        <> (if null activeLines then map renderUnitSummary (take 10 units) else activeLines)
        <> foldedLine
        <> [footer]
+       <> helpLine
        )
+  where
+    renderUnitWithCursor (accLines, curIdx) u =
+      let uHeader = renderUnitSummary u
+          mods = Map.elems (uiModules u)
+          renderMod (mAcc, rIdx) m =
+            let vState = statusToVisual (miStatus m)
+                glyph = stateGlyph vState
+                modRatio = case miStatus m of
+                  ModDone _ _ -> 1.0
+                  ModCompiling _ -> 0.5
+                  _ -> 0.0
+                modBar = renderBar 12 modRatio
+                infoStr = case miStatus m of
+                  ModDone ms alloc -> formatDurationMs ms <> " (" <> formatBytes alloc <> ")"
+                  ModCompiling _ ->
+                    let phases = Map.keys (miPhases m)
+                    in if null phases then "compiling" else T.intercalate "/" (take 2 phases)
+                  ModSkipped reas -> reas
+                  ModFailed errs -> "failed (" <> T.pack (show errs) <> " errors)"
+                  ModBlocked blk -> "blocked by " <> blk
+                  _ -> stateName vState
+                cursor = if mSel == Just rIdx then "▶ " else "  "
+                rowText = cursor <> "  " <> T.singleton glyph <> " " <> miName m <> " " <> modBar <> " " <> infoStr
+            in (rowText : mAcc, rIdx + 1)
+          (modRowsRev, nextIdx) = foldl renderMod ([], curIdx) (take 10 mods)
+      in (accLines <> [uHeader] <> reverse modRowsRev, nextIdx)
 
--- | Renders an active unit and its compiling or finished modules.
-renderActiveUnit :: UnitInfo -> [Text]
-renderActiveUnit u =
-  let uHeader = renderUnitSummary u
-      mods = Map.elems (uiModules u)
-      renderModRow m =
-        let vState = statusToVisual (miStatus m)
-            glyph = stateGlyph vState
-            modRatio = case miStatus m of
-              ModDone _ _ -> 1.0
-              ModCompiling _ -> 0.5
-              _ -> 0.0
-            modBar = renderBar 12 modRatio
-            infoStr = case miStatus m of
-              ModDone ms alloc -> formatDurationMs ms <> " (" <> formatBytes alloc <> ")"
-              ModCompiling _ ->
-                let phases = Map.keys (miPhases m)
-                in if null phases then "compiling" else T.intercalate "/" (take 2 phases)
-              ModSkipped reas -> reas
-              ModFailed errs -> "failed (" <> T.pack (show errs) <> " errors)"
-              ModBlocked blk -> "blocked by " <> blk
-              _ -> stateName vState
-        in "    " <> T.singleton glyph <> " " <> miName m <> " " <> modBar <> " " <> infoStr
-      modRows = map renderModRow (take 10 mods)
-  in uHeader : modRows
+-- | Formats the default Graph Frontier view (§12.1).
+renderGraphView :: BuildModel -> Text
+renderGraphView = renderGraphViewSelected Nothing
 
 -- | Renders a concise summary for a single unit within the graph view.
 renderUnitSummary :: UnitInfo -> Text
