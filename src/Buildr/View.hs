@@ -31,7 +31,7 @@ import Buildr.Event (BuildOutcome (..))
 import Buildr.Grammar
 import Buildr.Model
 import Data.Int (Int64)
-import Data.List (maximumBy)
+import Data.List (maximumBy, partition)
 import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)
 import Data.Text (Text)
@@ -55,21 +55,55 @@ renderView = \case
   ViewPlain  -> renderPlainView
   ViewLinear -> renderLinearView
 
--- | Formats the default Graph Frontier view.
+-- | Formats the default Graph Frontier view (§12.1).
 renderGraphView :: BuildModel -> Text
 renderGraphView model =
   let units = Map.elems (bmUnits model)
       totalUnits = length units
-      unitHeaders = map renderUnitSummary units
+      isActive u = case uiStatus u of
+        UnitPlanned -> not (Map.null (uiModules u))
+        _           -> True
+      (activeUnits, inactiveUnits) = partition isActive units
+      activeLines = concatMap renderActiveUnit activeUnits
+      foldedLine = if null inactiveUnits
+                     then []
+                     else ["  ▸ " <> T.pack (show (length inactiveUnits)) <> " dependencies planned/waiting"]
       footer = "Overall: " <> renderOverallBar model
   in T.unlines
        ( [ "=== buildr: Graph Frontier (Units: " <> T.pack (show totalUnits)
              <> " | Slots: " <> T.pack (show (bmBusySlots model)) <> "/"
              <> T.pack (show (bmTotalSlots model)) <> ") ==="
          ]
-       <> unitHeaders
+       <> (if null activeLines then map renderUnitSummary (take 10 units) else activeLines)
+       <> foldedLine
        <> [footer]
        )
+
+-- | Renders an active unit and its compiling or finished modules.
+renderActiveUnit :: UnitInfo -> [Text]
+renderActiveUnit u =
+  let uHeader = renderUnitSummary u
+      mods = Map.elems (uiModules u)
+      renderModRow m =
+        let vState = statusToVisual (miStatus m)
+            glyph = stateGlyph vState
+            modRatio = case miStatus m of
+              ModDone _ _ -> 1.0
+              ModCompiling _ -> 0.5
+              _ -> 0.0
+            modBar = renderBar 12 modRatio
+            infoStr = case miStatus m of
+              ModDone ms alloc -> formatDurationMs ms <> " (" <> formatBytes alloc <> ")"
+              ModCompiling _ ->
+                let phases = Map.keys (miPhases m)
+                in if null phases then "compiling" else T.intercalate "/" (take 2 phases)
+              ModSkipped reas -> reas
+              ModFailed errs -> "failed (" <> T.pack (show errs) <> " errors)"
+              ModBlocked blk -> "blocked by " <> blk
+              _ -> stateName vState
+        in "    " <> T.singleton glyph <> " " <> miName m <> " " <> modBar <> " " <> infoStr
+      modRows = map renderModRow (take 10 mods)
+  in uHeader : modRows
 
 -- | Renders a concise summary for a single unit within the graph view.
 renderUnitSummary :: UnitInfo -> Text

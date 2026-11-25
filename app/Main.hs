@@ -9,8 +9,9 @@ module Main (main) where
 
 import Buildr.Core
 import Control.Concurrent (MVar, forkIO, killThread, modifyMVar_, newMVar, readMVar, threadDelay)
-import Control.Exception (bracket)
-import Control.Monad (forever, unless)
+import Control.Concurrent.Async (async, wait)
+import Control.Exception (bracket, bracket_)
+import Control.Monad (forever, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
 import Data.Int (Int64)
@@ -31,8 +32,15 @@ import System.Directory
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (hFlush, stdout)
-import System.Process (CreateProcess (..), createProcess, proc, readProcessWithExitCode, waitForProcess)
+import System.IO (Handle, hFlush, hIsEOF, stdout)
+import System.Process
+  ( CreateProcess (..)
+  , StdStream (..)
+  , createProcess
+  , proc
+  , readProcessWithExitCode
+  , waitForProcess
+  )
 
 -- | Top-level CLI commands defined in §18.
 data Command
@@ -237,25 +245,51 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
                   cabalArgs = [ "build", "-w", ghcLink ]
                            <> [ "--keep-going" | keepGoing ]
                            <> targets
-                  cabalProc = (proc "cabal" cabalArgs) { env = Just buildrEnv }
+                  cabalProc = (proc "cabal" cabalArgs)
+                    { env     = Just buildrEnv
+                    , std_in  = Inherit
+                    , std_out = CreatePipe
+                    , std_err = Inherit
+                    }
 
-              (_, _, _, ph) <- createProcess cabalProc
-              code <- waitForProcess ph
-              endNs <- getMonotonicTimeNSec
+              bracket_ (unless (viewMode == ViewPlain) (putStr "\ESC[?25l"))
+                       (unless (viewMode == ViewPlain) (putStr "\ESC[?25h\n")) $ do
+                (_, Just hOut, _, ph) <- createProcess cabalProc
+                cabalWorker <- async (readCabalStdout hOut modelVar cacheVar recordFile viewMode)
+                code <- waitForProcess ph
+                wait cabalWorker
+                endNs <- getMonotonicTimeNSec
 
-              -- 5. Finalize rendering
-              killThread renderThread
-              stopIpcServer serverHandle
-              finalModel <- readMVar modelVar
-              finalCache <- readMVar cacheVar
-              _ <- saveHistoryCache histPath finalCache
+                -- 5. Finalize rendering
+                killThread renderThread
+                stopIpcServer serverHandle
+                finalModel <- readMVar modelVar
+                finalCache <- readMVar cacheVar
+                _ <- saveHistoryCache histPath finalCache
 
-              let totalWallNs = fromIntegral (endNs - startNs) :: Int64
-              unless (viewMode == ViewZen) $ do
-                TIO.putStr (renderSummaryBlock finalModel totalWallNs)
-              exitWith code
+                let totalWallNs = fromIntegral (endNs - startNs) :: Int64
+                unless (viewMode == ViewZen) $ do
+                  TIO.putStr (renderSummaryBlock finalModel totalWallNs)
+                exitWith code
   where
     cleanupServer _ = pure ()
+
+-- | Concurrently reads Cabal stdout, streaming to console in plain view and updating lifecycle state.
+readCabalStdout :: Handle -> MVar BuildModel -> MVar HistoryCache -> Maybe FilePath -> ViewMode -> IO ()
+readCabalStdout hOut modelVar cacheVar maybeLogPath viewMode = do
+  eof <- hIsEOF hOut
+  unless eof $ do
+    line <- TIO.hGetLine hOut
+    when (viewMode == ViewPlain) $ do
+      TIO.putStrLn line
+      hFlush stdout
+    case parseCabalLifecycleLine line of
+      Just payload -> do
+        nowNs <- getMonotonicTimeNSec
+        let ev = mkEvent 0 (fromIntegral nowNs :: Int64) SrcCabal ValueObserved payload
+        onIpcEvent modelVar cacheVar maybeLogPath ev
+      Nothing -> pure ()
+    readCabalStdout hOut modelVar cacheVar maybeLogPath viewMode
 
 -- | Handler updating model MVar and history cache upon receiving an event from wrapper over IPC.
 onIpcEvent :: MVar BuildModel -> MVar HistoryCache -> Maybe FilePath -> Event -> IO ()

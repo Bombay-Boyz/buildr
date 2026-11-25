@@ -9,7 +9,7 @@
 -- Transparent compiler wrapper adhering to §8.1 & §8.2:
 --   * Passes through informational queries untouched.
 --   * Appends JSON diagnostics and timing dumps to real compilation passes.
---   * Streams ModuleStarted / ModuleFinished events to BUILDR_SOCKET.
+--   * Streams ModuleStarted / ModuleFinished / ModulePhase events to BUILDR_SOCKET.
 --   * Completely preserves Cabal stdout/stderr streams.
 module Main (main) where
 
@@ -18,16 +18,21 @@ import Buildr.Core
   , EventSource (..)
   , ValueKind (..)
   , mkEvent
+  , parseTimingLine
   , sendIpcEvent
   )
+import Control.Concurrent.Async (async, wait)
+import Control.Monad (unless)
 import Data.Int (Int64)
 import Data.List (isSuffixOf)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import GHC.Clock (getMonotonicTimeNSec)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
-import System.Process (createProcess, proc, waitForProcess)
+import System.IO (Handle, hFlush, hIsEOF, stderr)
+import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
 
 -- | Query flags that must never receive extra compilation flags or interference.
 isQueryFlag :: String -> Bool
@@ -88,7 +93,7 @@ main = do
           pure ()
         Nothing -> pure ()
 
-      code <- runGhcCapture (args <> extraFlags)
+      code <- runGhcCapture socketEnv unitId modName (args <> extraFlags)
       endNs <- getMonotonicTimeNSec
 
       case socketEnv of
@@ -113,8 +118,36 @@ runGhc args = do
   code <- waitForProcess ph
   exitWith code
 
--- | Executes real GHC and returns its exit code.
-runGhcCapture :: [String] -> IO ExitCode
-runGhcCapture args = do
-  (_, _, _, ph) <- createProcess (proc "ghc" args)
-  waitForProcess ph
+-- | Executes real GHC with piped stderr, forwarding lines to stderr and parsing timings to IPC.
+runGhcCapture :: Maybe FilePath -> Text -> Text -> [String] -> IO ExitCode
+runGhcCapture mSocket unitId modName args = case mSocket of
+  Nothing -> do
+    (_, _, _, ph) <- createProcess (proc "ghc" args)
+    waitForProcess ph
+  Just sockPath -> do
+    (_, _, Just hErr, ph) <- createProcess (proc "ghc" args)
+      { std_in  = Inherit
+      , std_out = Inherit
+      , std_err = CreatePipe
+      }
+    errWorker <- async (teeStderr sockPath hErr)
+    code <- waitForProcess ph
+    wait errWorker
+    pure code
+  where
+    teeStderr :: FilePath -> Handle -> IO ()
+    teeStderr sockPath hErr = do
+      eof <- hIsEOF hErr
+      unless eof $ do
+        line <- TIO.hGetLine hErr
+        TIO.hPutStrLn stderr line
+        hFlush stderr
+        case parseTimingLine line of
+          Just (phase, ms, alloc) -> do
+            nowNs <- getMonotonicTimeNSec
+            let phaseEv = mkEvent 0 (fromIntegral nowNs :: Int64) SrcGhc ValueReported
+                            (PayloadModulePhase unitId modName phase ms alloc)
+            _ <- sendIpcEvent sockPath phaseEv
+            pure ()
+          Nothing -> pure ()
+        teeStderr sockPath hErr

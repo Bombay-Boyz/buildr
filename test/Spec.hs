@@ -232,7 +232,23 @@ runBoundaryTests = do
       ciOut = renderPlainViewCi builtModel
       ciGroupOk = T.isInfixOf "::group::Unit" ciOut && T.isInfixOf "::endgroup::" ciOut
 
-      boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone && ciGroupOk
+      -- Stream recogniser tests (§22 G4, G5)
+      t1 = parseTimingLine "Renamer/typechecker [Buildr.Model]: alloc=14856000 time=15.420"
+      t1Ok = case t1 of
+        Just (phase, ms, alloc) -> phase == "Renamer/typechecker" && ms == 15 && alloc == 14856000
+        Nothing -> False
+
+      c1 = parseCabalLifecycleLine "Building library for buildr-0.1.0.0..."
+      c1Ok = case c1 of
+        Just (PayloadUnitStarted p) -> p == "buildr-0.1.0.0"
+        _ -> False
+
+      c2 = parseCabalLifecycleLine "Completed text-2.1.3 (lib)"
+      c2Ok = case c2 of
+        Just (PayloadUnitCompleted p 0) -> p == "text-2.1.3"
+        _ -> False
+
+      boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone && ciGroupOk && t1Ok && c1Ok && c2Ok
   if boundaryOk
     then do
       putStrLn "  Boundary outlier tests: PASS"

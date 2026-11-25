@@ -32,6 +32,9 @@ module Buildr.Event
   , mkEvent
   , encodeEventLine
   , decodeEventLine
+    -- * Stream Recognisers (§22 G4, G5)
+  , parseTimingLine
+  , parseCabalLifecycleLine
   ) where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?), (.=), object, withObject, encode, decodeStrict)
@@ -42,6 +45,7 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
 import GHC.Generics (Generic)
+import Text.Read (readMaybe)
 
 -- | Current protocol major version (fixed at 1 for Event Protocol v1).
 type ProtocolVersion = Int
@@ -360,3 +364,49 @@ encodeEventLine ev = BSL.toStrict (encode ev) <> "\n"
 -- | Deserializes a single JSON line into an Event.
 decodeEventLine :: BS.ByteString -> Maybe Event
 decodeEventLine = decodeStrict
+
+-- | Purely parses a GHC -ddump-timings line into (phaseName, ms, allocBytes) (§22 G4).
+parseTimingLine :: Text -> Maybe (Text, Int64, Int64)
+parseTimingLine line =
+  let ws = T.words line
+      findPref pref = case filter (T.isPrefixOf pref) ws of
+        (w:_) -> Just (T.drop (T.length pref) w)
+        []    -> Nothing
+  in case (findPref "alloc=", findPref "time=") of
+       (Just allocTxt, Just timeTxt) ->
+         case (readMaybe (T.unpack allocTxt) :: Maybe Int64, readMaybe (T.unpack timeTxt) :: Maybe Double) of
+           (Just alloc, Just timeD) ->
+             let phaseWords = takeWhile (\w -> not (T.isPrefixOf "alloc=" w)) ws
+                 rawPhase = T.unwords phaseWords
+                 cleanPhase = T.dropWhileEnd (== ':') (T.takeWhile (/= '[') rawPhase)
+                 phaseName = if T.null (T.strip cleanPhase) then "phase" else T.strip cleanPhase
+                 timeMs = max 1 (round timeD :: Int64)
+             in Just (phaseName, timeMs, alloc)
+           _ -> Nothing
+       _ -> Nothing
+
+-- | Purely parses Cabal stdout lifecycle lines to detect unit progress (§22 G5).
+parseCabalLifecycleLine :: Text -> Maybe EventPayload
+parseCabalLifecycleLine rawLine =
+  let line = T.strip rawLine
+      ws = T.words line
+  in case ws of
+       ("Starting" : pkg : _) ->
+         Just (PayloadUnitStarted (cleanPkg pkg))
+       ("Building" : "library" : "for" : pkg : _) ->
+         Just (PayloadUnitStarted (cleanPkg pkg))
+       ("Building" : "executable" : _exe : "for" : pkg : _) ->
+         Just (PayloadUnitStarted (cleanPkg pkg))
+       ("Building" : "test" : "suite" : _tst : "for" : pkg : _) ->
+         Just (PayloadUnitStarted (cleanPkg pkg))
+       ("Building" : pkg : _) ->
+         Just (PayloadUnitStarted (cleanPkg pkg))
+       ("Installing" : pkg : _) ->
+         Just (PayloadUnitCompleted (cleanPkg pkg) 0)
+       ("Completed" : pkg : _) ->
+         Just (PayloadUnitCompleted (cleanPkg pkg) 0)
+       ("Failed" : pkg : _) ->
+         Just (PayloadUnitFailed (cleanPkg pkg) 1 Nothing)
+       _ -> Nothing
+  where
+    cleanPkg p = T.dropWhileEnd (== '.') (T.takeWhile (/= '(') p)

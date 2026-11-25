@@ -34,6 +34,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text as T
 
 -- | Detailed state for an individual module in the build graph.
 data ModuleStatus
@@ -92,13 +93,25 @@ initialModel = BuildModel
   , bmTotalSlots = 1
   }
 
--- | Updates a unit inside the model map safely.
-updateUnit :: Text -> (UnitInfo -> UnitInfo) -> BuildModel -> BuildModel
-updateUnit uid f model =
+-- | Updates a unit inside the model map safely by exact unit id or matching package name.
+updateUnitByPkgOrId :: Text -> (UnitInfo -> UnitInfo) -> BuildModel -> BuildModel
+updateUnitByPkgOrId target f model =
   let units = bmUnits model
-  in case Map.lookup uid units of
-       Nothing -> model
-       Just u  -> model { bmUnits = Map.insert uid (f u) units }
+  in case Map.lookup target units of
+       Just u  -> model { bmUnits = Map.insert target (f u) units }
+       Nothing ->
+         let matchingKeys = [ k | (k, u) <- Map.toList units
+                                , uiPackage u == target
+                               || T.isPrefixOf target (uiPackage u)
+                               || T.isPrefixOf (uiPackage u) target
+                               || T.isPrefixOf target k ]
+         in case matchingKeys of
+              (k:_) -> case Map.lookup k units of
+                         Just u  -> model { bmUnits = Map.insert k (f u) units }
+                         Nothing -> model
+              []    ->
+                let newUnit = UnitInfo target target UnitPlanned Map.empty
+                in model { bmUnits = Map.insert target (f newUnit) units }
 
 -- | Pure state fold: applies a single event to advance the model state.
 applyEvent :: BuildModel -> Event -> BuildModel
@@ -109,7 +122,7 @@ applyEvent model ev = case eventPayload ev of
     in model { bmUnits = foldl (\m u -> addUnit m u) (bmUnits model) units }
 
   PayloadGraphKnown uid mods edges ->
-    updateUnit uid (\u ->
+    updateUnitByPkgOrId uid (\u ->
       let edgeMap = foldl (\acc e -> Set.insert (geTarget e) acc) Set.empty edges
           addMod acc m =
             Map.insert (mnName m) (ModuleInfo (mnName m) uid ModPending edgeMap False Map.empty) acc
@@ -117,42 +130,48 @@ applyEvent model ev = case eventPayload ev of
       ) model
 
   PayloadUnitStarted uid ->
-    updateUnit uid (\u -> u { uiStatus = UnitBuilding (eventTimestamp ev) }) model
+    updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitBuilding (eventTimestamp ev) }) model
 
   PayloadUnitCompleted uid code ->
-    updateUnit uid (\u -> u { uiStatus = UnitCompleted code }) model
+    updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitCompleted code }) model
 
   PayloadUnitFailed uid code logPath ->
-    let m1 = updateUnit uid (\u -> u { uiStatus = UnitFailed code logPath }) model
+    let m1 = updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitFailed code logPath }) model
     in deriveBlockedAndNotReached uid m1
 
   PayloadUnitStopped uid ->
-    let m1 = updateUnit uid (\u -> u { uiStatus = UnitStopped }) model
+    let m1 = updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitStopped }) model
     in deriveBlockedAndNotReached uid m1
 
   PayloadModuleStarted uid modName _k _n _src _obj _reas ->
-    updateUnit uid (\u ->
+    updateUnitByPkgOrId uid (\u ->
       let mods = uiModules u
       in case Map.lookup modName mods of
-           Nothing -> u
+           Nothing ->
+             let newM = ModuleInfo modName (uiId u) (ModCompiling (eventTimestamp ev)) Set.empty False Map.empty
+             in u { uiModules = Map.insert modName newM mods }
            Just m  -> u { uiModules = Map.insert modName (m { miStatus = ModCompiling (eventTimestamp ev) }) mods }
       ) model
 
   PayloadModulePhase uid modName phase ms alloc ->
-    updateUnit uid (\u ->
+    updateUnitByPkgOrId uid (\u ->
       let mods = uiModules u
       in case Map.lookup modName mods of
-           Nothing -> u
+           Nothing ->
+             let newM = ModuleInfo modName (uiId u) (ModCompiling (eventTimestamp ev)) Set.empty False (Map.singleton phase (ms, alloc))
+             in u { uiModules = Map.insert modName newM mods }
            Just m  ->
              let newPhases = Map.insert phase (ms, alloc) (miPhases m)
              in u { uiModules = Map.insert modName (m { miPhases = newPhases }) mods }
       ) model
 
   PayloadModuleFinished uid modName ->
-    updateUnit uid (\u ->
+    updateUnitByPkgOrId uid (\u ->
       let mods = uiModules u
       in case Map.lookup modName mods of
-           Nothing -> u
+           Nothing ->
+             let newM = ModuleInfo modName (uiId u) (ModDone 1 0) Set.empty True Map.empty
+             in u { uiModules = Map.insert modName newM mods }
            Just m  ->
              let totalMs = sum (map fst (Map.elems (miPhases m)))
                  totalAlloc = sum (map snd (Map.elems (miPhases m)))
@@ -166,10 +185,12 @@ applyEvent model ev = case eventPayload ev of
       ) model
 
   PayloadModuleSkipped uid modName reas ->
-    updateUnit uid (\u ->
+    updateUnitByPkgOrId uid (\u ->
       let mods = uiModules u
       in case Map.lookup modName mods of
-           Nothing -> u
+           Nothing ->
+             let newM = ModuleInfo modName (uiId u) (ModSkipped reas) Set.empty False Map.empty
+             in u { uiModules = Map.insert modName newM mods }
            Just m  -> u { uiModules = Map.insert modName (m { miStatus = ModSkipped reas }) mods }
       ) model
 
@@ -184,7 +205,7 @@ applyEvent model ev = case eventPayload ev of
 -- | Propagates blocked and not-reached states for modules in a failed or stopped unit.
 deriveBlockedAndNotReached :: Text -> BuildModel -> BuildModel
 deriveBlockedAndNotReached uid model =
-  updateUnit uid (\u ->
+  updateUnitByPkgOrId uid (\u ->
     let failedMods = Map.keysSet (Map.filter (\m -> case miStatus m of ModFailed _ -> True; _ -> False) (uiModules u))
         updateStatus m = case miStatus m of
           ModPending

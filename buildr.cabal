@@ -70,6 +70,7 @@ executable buildr
     build-depends:
         base,
         buildr,
+        async,
         bytestring,
         containers,
         directory,
@@ -86,6 +87,7 @@ executable buildr-ghc
     build-depends:
         base,
         buildr,
+        async,
         network,
         process,
         text,
