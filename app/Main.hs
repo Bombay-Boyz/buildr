@@ -30,7 +30,7 @@ import System.Directory
   )
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO (hFlush, stdout)
 import System.Process (CreateProcess (..), createProcess, proc, readProcessWithExitCode, waitForProcess)
 
@@ -179,6 +179,11 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
         Right units -> do
           let planEvent = mkEvent 1 0 SrcPlan ValueReported (PayloadPlanReady units)
               m0 = applyEvent initialModel planEvent
+          case recordFile of
+            Just path -> do
+              createDirectoryIfMissing True (takeDirectory path)
+              BS.appendFile path (encodeEventLine planEvent <> "\n")
+            Nothing -> pure ()
           modelVar <- newMVar m0
 
           -- Setup persistent history
@@ -263,7 +268,9 @@ onIpcEvent modelVar cacheVar maybeLogPath ev = do
       modifyMVar_ cacheVar (\c -> pure (insertTiming key 100 1024 c))
     _ -> pure ()
   case maybeLogPath of
-    Just path -> BS.appendFile path (encodeEventLine ev <> "\n")
+    Just path -> do
+      createDirectoryIfMissing True (takeDirectory path)
+      BS.appendFile path (encodeEventLine ev <> "\n")
     Nothing   -> pure ()
 
 -- | Periodically refreshes terminal display with latest model state.

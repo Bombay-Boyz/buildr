@@ -101,6 +101,7 @@ test-suite buildr-test
         base,
         buildr,
         aeson,
+        bytestring,
         containers,
         directory,
         filepath,

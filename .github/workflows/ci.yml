@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: GHC ${{ matrix.ghc }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ghc: ["9.10.3"]
+        cabal: ["3.16.1.0"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Haskell
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: ${{ matrix.cabal }}
+
+      - name: Cabal Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-${{ matrix.ghc }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project*') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.ghc }}-cabal-
+
+      - name: Update Cabal package list
+        run: cabal update
+
+      - name: Build all targets with -Werror
+        run: cabal build all
+
+      - name: Run verification test suite
+        run: cabal test --test-show-details=direct
+
+      - name: Run buildr doctor health check
+        run: cabal run buildr -- doctor
+
+      - name: Verify Rasika theme contrast
+        run: cabal run buildr -- theme check
+
+      - name: Replay sample fixtures
+        run: |
+          cabal run buildr -- replay fixtures/sample-success.jsonl --view plain
+          cabal run buildr -- replay fixtures/sample-success.jsonl --view zen
+          cabal run buildr -- replay fixtures/sample-success.jsonl --view linear

@@ -1,0 +1,14 @@
+{"kind":"PlanReady","seq":1,"src":"plan","t":0,"units":[{"puComponent":"lib","puDependencies":[],"puId":"core-lib","puPackage":"core-pkg","puRebuildReason":null,"puStyle":"local","puVersion":"0.1.0"}],"v":1,"valueKind":"reported"}
+{"edges":[{"geIsSourceImport":false,"geTarget":"Core.Types"}],"kind":"GraphKnown","modules":[{"mnIsBoot":false,"mnName":"Core.Types","mnSourcePath":"src/Core/Types.hs"},{"mnIsBoot":false,"mnName":"Core.Logic","mnSourcePath":"src/Core/Logic.hs"},{"mnIsBoot":false,"mnName":"Core.Main","mnSourcePath":"src/Core/Main.hs"}],"seq":2,"src":"graph","t":10000000,"unit":"core-lib","v":1,"valueKind":"reported"}
+{"kind":"UnitStarted","seq":3,"src":"cabal","t":20000000,"unit":"core-lib","v":1,"valueKind":"observed"}
+{"k":1,"kind":"ModuleStarted","module":"Core.Types","n":3,"obj":"src/Core/Types.o","reason":"source changed","seq":4,"src":"ghc","t":30000000,"unit":"core-lib","v":1,"valueKind":"observed"}
+{"alloc":5242880,"kind":"ModulePhase","module":"Core.Types","ms":120,"phase":"typecheck","seq":5,"src":"ghc","t":150000000,"unit":"core-lib","v":1,"valueKind":"reported"}
+{"kind":"ModuleFinished","module":"Core.Types","seq":6,"src":"ghc","t":160000000,"unit":"core-lib","v":1,"valueKind":"reported"}
+{"k":2,"kind":"ModuleStarted","module":"Core.Logic","n":3,"obj":"src/Core/Logic.o","reason":"source changed","seq":7,"src":"ghc","t":170000000,"unit":"core-lib","v":1,"valueKind":"observed"}
+{"alloc":10485760,"kind":"ModulePhase","module":"Core.Logic","ms":250,"phase":"codegen","seq":8,"src":"ghc","t":420000000,"unit":"core-lib","v":1,"valueKind":"reported"}
+{"kind":"ModuleFinished","module":"Core.Logic","seq":9,"src":"ghc","t":430000000,"unit":"core-lib","v":1,"valueKind":"reported"}
+{"k":3,"kind":"ModuleStarted","module":"Core.Main","n":3,"obj":"src/Core/Main.o","reason":"source changed","seq":10,"src":"ghc","t":440000000,"unit":"core-lib","v":1,"valueKind":"observed"}
+{"alloc":2097152,"kind":"ModulePhase","module":"Core.Main","ms":80,"phase":"simplify","seq":11,"src":"ghc","t":520000000,"unit":"core-lib","v":1,"valueKind":"reported"}
+{"kind":"ModuleFinished","module":"Core.Main","seq":12,"src":"ghc","t":530000000,"unit":"core-lib","v":1,"valueKind":"reported"}
+{"exitCode":0,"kind":"UnitCompleted","seq":13,"src":"cabal","t":540000000,"unit":"core-lib","v":1,"valueKind":"observed"}
+{"counts":{"countBlocked":0,"countDone":3,"countFailed":0,"countNotReached":0,"countSkipped":0},"kind":"BuildDone","outcome":"success","seq":14,"src":"buildr","t":550000000,"v":1,"valueKind":"derived","wallNs":550000000}

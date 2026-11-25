@@ -21,8 +21,11 @@ import Buildr.Core
 import Control.Concurrent (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (bracket)
 import qualified Data.Aeson as Aeson
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC8
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (mapMaybe)
 import qualified Data.Text as T
 import System.Directory (doesFileExist, getTemporaryDirectory)
 import System.Exit (exitFailure, exitSuccess)
@@ -238,6 +241,41 @@ runBoundaryTests = do
       putStrLn "  Boundary outlier tests: FAIL"
       pure False
 
+-- | Replay log golden tests against stored fixtures (§21).
+runGoldenReplayTests :: IO Bool
+runGoldenReplayTests = do
+  putStrLn "Running Golden Replay log tests..."
+  let successLogPath = "fixtures/sample-success.jsonl"
+      failureLogPath = "fixtures/sample-failure.jsonl"
+
+  succExists <- doesFileExist successLogPath
+  failExists <- doesFileExist failureLogPath
+
+  if not (succExists && failExists)
+    then do
+      putStrLn "  Skipping golden tests: fixture files missing"
+      pure True
+    else do
+      succBytes <- BS.readFile successLogPath
+      let succEvents = mapMaybe decodeEventLine (BSC8.lines succBytes)
+          succModel = foldEvents initialModel succEvents
+          succZen = renderZenView succModel
+          succLinear = renderLinearView succModel
+          succInv = checkModelInvariants succModel
+          succOk = T.isInfixOf "3/3" succZen && T.isInfixOf "100 percent" succLinear && succInv
+
+      failBytes <- BS.readFile failureLogPath
+      let failEvents = mapMaybe decodeEventLine (BSC8.lines failBytes)
+          failModel = foldEvents initialModel failEvents
+          failInv = checkModelInvariants failModel
+          failOk = failInv
+
+      let goldenOk = succOk && failOk
+      if goldenOk
+        then putStrLn "  Golden Replay log tests: PASS"
+        else putStrLn "  Golden Replay log tests: FAIL"
+      pure goldenOk
+
 main :: IO ()
 main = do
   putStrLn "=========================================================="
@@ -246,6 +284,7 @@ main = do
   bOk <- runBoundaryTests
   planOk <- runPlanTests
   ipcOk <- runIpcTests
+  goldenOk <- runGoldenReplayTests
 
   res1 <- quickCheckResult (withNumTests 100 prop_eventJsonRoundTrip)
   res2 <- quickCheckResult (withNumTests 200 prop_barWidthRespectsBounds)
@@ -257,7 +296,7 @@ main = do
   res8 <- quickCheckResult (withNumTests 100 prop_summaryBlockCountsMatchModel)
   res9 <- quickCheckResult (withNumTests 100 prop_historyCacheJsonRoundTrip)
 
-  let allPassed = bOk && planOk && ipcOk && isSuccess res1 && isSuccess res2 && isSuccess res3
+  let allPassed = bOk && planOk && ipcOk && goldenOk && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
                       && isSuccess res7 && isSuccess res8 && isSuccess res9
   if allPassed

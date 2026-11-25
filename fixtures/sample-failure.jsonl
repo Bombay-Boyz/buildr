@@ -1,0 +1,6 @@
+{"kind":"PlanReady","seq":1,"src":"plan","t":0,"units":[{"puComponent":"lib","puDependencies":[],"puId":"bad-lib","puPackage":"bad-pkg","puRebuildReason":null,"puStyle":"local","puVersion":"0.1.0"}],"v":1,"valueKind":"reported"}
+{"edges":[{"geIsSourceImport":false,"geTarget":"Bad.Broken"}],"kind":"GraphKnown","modules":[{"mnIsBoot":false,"mnName":"Bad.Broken","mnSourcePath":"src/Bad/Broken.hs"},{"mnIsBoot":false,"mnName":"Bad.Downstream","mnSourcePath":"src/Bad/Downstream.hs"}],"seq":2,"src":"graph","t":10000000,"unit":"bad-lib","v":1,"valueKind":"reported"}
+{"kind":"UnitStarted","seq":3,"src":"cabal","t":20000000,"unit":"bad-lib","v":1,"valueKind":"observed"}
+{"k":1,"kind":"ModuleStarted","module":"Bad.Broken","n":2,"obj":"src/Bad/Broken.o","reason":"source changed","seq":4,"src":"ghc","t":30000000,"unit":"bad-lib","v":1,"valueKind":"observed"}
+{"exitCode":1,"kind":"UnitFailed","log":"/tmp/cabal-bad.log","seq":5,"src":"cabal","t":80000000,"unit":"bad-lib","v":1,"valueKind":"observed"}
+{"counts":{"countBlocked":1,"countDone":0,"countFailed":1,"countNotReached":0,"countSkipped":0},"kind":"BuildDone","outcome":"failed","seq":6,"src":"buildr","t":90000000,"v":1,"valueKind":"derived","wallNs":90000000}
