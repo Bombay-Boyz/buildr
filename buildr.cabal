@@ -1,0 +1,77 @@
+cabal-version:      3.0
+name:               buildr
+version:            0.1.0.0
+synopsis:           A compilation renderer and build front-end for Haskell
+license:            MIT
+license-file:       LICENSE
+author:             bombay boyz
+maintainer:         259497327+Bombay-Boyz@users.noreply.github.com
+copyright:          2026 bombay boyz
+category:           Development
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+
+common warnings
+    ghc-options:
+      -Wall
+      -Wcompat
+      -Wincomplete-patterns
+      -Wincomplete-record-updates
+      -Wredundant-constraints
+    default-language:   GHC2021
+    default-extensions:
+      StrictData
+      BangPatterns
+      LambdaCase
+      OverloadedStrings
+
+library
+    import:           warnings
+    exposed-modules:
+        Buildr.Core
+        Buildr.Event
+        Buildr.Model
+        Buildr.Grammar
+        Buildr.View
+        Buildr.History
+    hs-source-dirs:   src
+    build-depends:
+        base >=4.20 && <5,
+        bytestring >=0.11 && <0.13,
+        containers >=0.6 && <0.8,
+        directory >=1.3 && <1.4,
+        filepath >=1.4 && <1.6,
+        text >=2.0 && <2.2,
+        time >=1.11 && <1.15
+
+executable buildr
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    ghc-options:      -threaded
+    build-depends:
+        base,
+        buildr,
+        directory,
+        filepath,
+        process,
+        text
+
+executable buildr-ghc
+    import:           warnings
+    main-is:          Main.hs
+    hs-source-dirs:   wrapper
+    ghc-options:      -threaded
+    build-depends:
+        base,
+        buildr,
+        process
+
+test-suite buildr-test
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    hs-source-dirs:   test
+    build-depends:
+        base,
+        buildr
