@@ -50,6 +50,7 @@ import System.Process
   , StdStream (..)
   , createProcess
   , proc
+  , readCreateProcessWithExitCode
   , readProcessWithExitCode
   , waitForProcess
   )
@@ -463,15 +464,20 @@ runWatch targets = do
 -- | Why mode showing rebuild reasons and interface diffs (§14, §18).
 runWhy :: String -> Maybe String -> IO ()
 runWhy modName maybeUnit = do
-  putStrLn ("buildr why: inspecting interface diffs for module " <> modName
-             <> maybe "" (\u -> " in unit " <> u) maybeUnit)
+  putStrLn "================================================================================"
+  putStrLn ("=== buildr why: Inspecting Rebuild Reasons for " <> modName <> " ===")
+  putStrLn "================================================================================"
   curEnv <- getEnvironment
   let whyEnv = ("BUILDR_WHY", "1") : curEnv
-      cabalArgs = ["build", "--ghc-options=-ddump-hi-diffs"]
+      unitArgs = maybe [] (\u -> [u]) maybeUnit
+      cabalArgs = ["build", "--ghc-options=-ddump-hi-diffs"] <> unitArgs
       cabalProc = (proc "cabal" cabalArgs) { env = Just whyEnv }
-  (_, _, _, ph) <- createProcess cabalProc
-  code <- waitForProcess ph
-  exitWith code
+  (exitCode, stdoutStr, stderrStr) <- readCreateProcessWithExitCode cabalProc ""
+  let fullOutput = T.pack (stdoutStr <> "\n" <> stderrStr)
+      diffs = parseHiDiffs fullOutput
+  TIO.putStr (formatRebuildDiff (T.pack modName) diffs)
+  putStrLn "================================================================================"
+  exitWith exitCode
 
 -- | Stats mode displaying estimate accuracy and timing statistics (§10.3, §18).
 runStats :: Maybe FilePath -> IO ()

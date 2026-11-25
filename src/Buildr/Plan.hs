@@ -17,11 +17,15 @@ module Buildr.Plan
     -- * File Loader
   , defaultPlanPath
   , loadPlanJson
+    -- * Interface Diff & Rebuild Reason Parsing (§14, §18)
+  , RebuildDiff (..)
+  , parseHiDiffs
+  , formatRebuildDiff
   ) where
 
 import Buildr.Error (PlanError (..))
 import Buildr.Event (PlanUnit (..), UnitStyle (..))
-import Data.Aeson (FromJSON (..), (.:), (.:?), withObject, eitherDecodeStrict)
+import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?), withObject, eitherDecodeStrict)
 import qualified Data.ByteString as BS
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -96,3 +100,81 @@ loadPlanJson path = do
       case eitherDecodeStrict content of
         Left err -> pure (Left (PlanJsonParseFailure path (T.pack err)))
         Right (RawPlan rawUnits) -> pure (Right (map translateUnit rawUnits))
+
+-- | Represents an interface-level rebuild difference parsed from GHC's @-ddump-hi-diffs@ (§14, §18).
+data RebuildDiff = RebuildDiff
+  { rdModule     :: !Text
+  , rdDependency :: !(Maybe Text)
+  , rdChanges    :: ![Text]
+  } deriving (Eq, Show, Generic)
+
+instance FromJSON RebuildDiff
+instance ToJSON RebuildDiff
+
+-- | Purely parses the output of GHC's @-ddump-hi-diffs@ into structured 'RebuildDiff' records.
+parseHiDiffs :: Text -> [RebuildDiff]
+parseHiDiffs rawText =
+  let ls = map T.strip (T.lines rawText)
+      step (curMod, curDep, curChanges, acc) line
+        | "Considering whether compilation is required for" `T.isPrefixOf` line =
+            let modName = T.dropWhileEnd (== ':') (T.strip (T.drop 47 line))
+                acc' = flush curMod curDep curChanges acc
+            in (Just modName, Nothing, [], acc')
+        | "Checking interface for module" `T.isPrefixOf` line =
+            let ws = T.words (T.drop 30 line)
+                depName = case ws of
+                  (w:_) -> w
+                  []    -> "unknown"
+            in (curMod, Just depName, curChanges, acc)
+        | isChangeLine line =
+            case (curMod, curDep) of
+              (Just _, Just dep) ->
+                let changeDesc = "[" <> dep <> "] " <> line
+                in (curMod, curDep, changeDesc : curChanges, acc)
+              (Just _, Nothing) ->
+                (curMod, curDep, line : curChanges, acc)
+              _ -> (curMod, curDep, curChanges, acc)
+        | otherwise = (curMod, curDep, curChanges, acc)
+
+      isChangeLine l =
+        ("Out of date:" `T.isPrefixOf` l)
+          || ("Module fingerprint has changed" `T.isPrefixOf` l)
+          || ("ABI hash has changed" `T.isPrefixOf` l)
+          || ("Source file modified" `T.isPrefixOf` l)
+
+      flush Nothing _ _ acc = acc
+      flush (Just m) mDep changes acc =
+        RebuildDiff m mDep (reverse changes) : acc
+
+      (finalMod, finalDep, finalChanges, finalAcc) = foldl step (Nothing, Nothing, [], []) ls
+  in reverse (flush finalMod finalDep finalChanges finalAcc)
+
+-- | Formats a human-readable explanation of why a module was recompiled (§14, §18).
+formatRebuildDiff :: Text -> [RebuildDiff] -> Text
+formatRebuildDiff targetMod diffs =
+  let matches d = rdModule d == targetMod
+               || T.isSuffixOf ("." <> rdModule d) targetMod
+               || T.isSuffixOf ("." <> targetMod) (rdModule d)
+      matching = filter matches diffs
+  in case matching of
+       (d:_) ->
+         let depDesc = case rdDependency d of
+               Just dep -> "Interface change detected in upstream dependency '" <> dep <> "'"
+               Nothing  -> "Direct source file modification on disk"
+             changeLines = map ("    • " <>) (rdChanges d)
+             explanation = case rdDependency d of
+               Just dep -> "Explanation: " <> targetMod <> " was recompiled because its imported dependency '" <> dep <> "' changed an exported type signature, binding, or ABI fingerprint."
+               Nothing  -> "Explanation: " <> targetMod <> " was recompiled because its source file content or timestamp changed."
+         in T.unlines
+              ( [ "Target module:   " <> targetMod
+                , "Rebuild trigger: " <> depDesc
+                ]
+              <> (if null changeLines then [] else "Differences:" : changeLines)
+              <> [explanation]
+              )
+       [] ->
+         T.unlines
+           [ "Target module:   " <> targetMod
+           , "Rebuild trigger: Source file modification on disk"
+           , "Explanation:     " <> targetMod <> " was recompiled because its source file content or timestamp changed (no upstream interface diffs reported)."
+           ]

@@ -329,8 +329,27 @@ runBoundaryTests = do
       modImportsOk = parseImports "import qualified Data.Map as Map\nimport {-# SOURCE #-} Test.Sub\n"
                   == [("Data.Map", False), ("Test.Sub", True)]
 
+      -- Interface diff and rebuild reason tests (§14, §18)
+      hiDiffSample = T.unlines
+        [ "Considering whether compilation is required for ModB:"
+        , "Checking interface for module ModA main"
+        , "  Module fingerprint has changed 1234abcd -> 5678ef01"
+        , "  Out of date: foo 1111 -> 2222"
+        ]
+      parsedHiDiffs = parseHiDiffs hiDiffSample
+      hiDiffOk = case parsedHiDiffs of
+        [d] -> rdModule d == "ModB"
+            && rdDependency d == Just "ModA"
+            && length (rdChanges d) == 2
+        _   -> False
+      formattedWhy = formatRebuildDiff "ModB" parsedHiDiffs
+      whyFormatOk = T.isInfixOf "Target module:   ModB" formattedWhy
+                 && T.isInfixOf "Interface change detected in upstream dependency 'ModA'" formattedWhy
+                 && T.isInfixOf "Out of date: foo" formattedWhy
+
       boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone && ciGroupOk && t1Ok && c1Ok && c2Ok
                 && diagParsedOk && diagFormatOk && srcGraphOk && kahnValid && modHeaderOk && modImportsOk
+                && hiDiffOk && whyFormatOk
   if boundaryOk
     then do
       putStrLn "  Boundary outlier tests: PASS"
