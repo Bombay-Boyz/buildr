@@ -26,15 +26,16 @@ import qualified Data.ByteString.Char8 as BSC8
 import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import System.Directory (doesFileExist, getTemporaryDirectory)
+import System.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, findExecutable, getTemporaryDirectory)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.Posix.Signals (sigTERM)
-import System.Process (CreateProcess (..), createProcess, proc, waitForProcess)
+import System.Process (CreateProcess (..), createProcess, proc, readCreateProcessWithExitCode, readProcessWithExitCode, waitForProcess)
 import Test.QuickCheck
 
 -- | Generator for valid Event Protocol v1 event sources.
@@ -691,6 +692,96 @@ prop_formatDiagnosticWithCapsHonesty = forAll genDiagnosticPayload $ \diag ->
           Nothing -> True
     in allMsgsIn && fileLinked && docLinked
 
+-- | Property 30: When invoked as a Cabal external command, non-subcommand invocations default to 'build' (§18).
+prop_partitionCliArgsCabalPluginDefaultsToBuild :: Property
+prop_partitionCliArgsCabalPluginDefaultsToBuild =
+  forAll (elements [[], ["lib:buildr"], ["app", "test:buildr-test"], ["all"]]) $ \targets ->
+    case partitionCliArgs True targets of
+      InvokeCommand (CmdBuild opts) -> cboTargets opts == targets
+      _                             -> False
+
+-- | Property 31: CLI argument partitioner accurately parses buildr-specific options.
+prop_partitionCliArgsRecognizesBuildrOptions :: Property
+prop_partitionCliArgsRecognizesBuildrOptions =
+  forAll genViewMode $ \vMode ->
+    forAll genErrorStyle $ \eStyle ->
+      let vStr = case vMode of
+            ViewGraph  -> "graph"
+            ViewZen    -> "zen"
+            ViewMosaic -> "mosaic"
+            ViewPlain  -> "plain"
+            ViewLinear -> "linear"
+          eStr = case eStyle of
+            ErrorClassic  -> "classic"
+            ErrorFriendly -> "friendly"
+          args = ["--view", vStr, "--errors", eStr, "--keep-going", "--explain-holes", "my-target"]
+      in case partitionCliArgs True args of
+           InvokeCommand (CmdBuild opts) ->
+             cboViewMode opts == Just vMode
+             && cboErrorStyle opts == Just eStyle
+             && cboKeepGoing opts == Just True
+             && cboExplainHoles opts == Just True
+             && cboTargets opts == ["my-target"]
+           _ -> False
+
+-- | Property 32: Unrecognized Cabal options are transparently preserved in passthrough args (§18).
+prop_partitionCliArgsCabalPassthrough :: Property
+prop_partitionCliArgsCabalPassthrough =
+  forAll (elements [["-j4"], ["--enable-tests", "-O2"], ["-v2", "--offline"]]) $ \passthrough ->
+    let args = ["--view", "zen"] <> passthrough <> ["lib:core"]
+    in case partitionCliArgs True args of
+         InvokeCommand (CmdBuild opts) ->
+           cboCabalArgs opts == passthrough
+           && cboTargets opts == ["lib:core"]
+           && cboViewMode opts == Just ViewZen
+         _ -> False
+
+-- | Property 33: Any arguments following double-dash '--' are forwarded to Cabal (§18).
+prop_partitionCliArgsDoubleDash :: Property
+prop_partitionCliArgsDoubleDash =
+  forAll (elements [["--flags=static"], ["-j8", "--ghc-options=-Wall"]]) $ \cabalArgs ->
+    let args = ["build", "--keep-going", "my-pkg", "--"] <> cabalArgs
+    in case partitionCliArgs False args of
+         InvokeCommand (CmdBuild opts) ->
+           cboCabalArgs opts == cabalArgs
+           && cboTargets opts == ["my-pkg"]
+           && cboKeepGoing opts == Just True
+         _ -> False
+
+-- | Property 34: Informational and query flags bypass TUI and delegate directly to Cabal (§18).
+prop_partitionCliArgsQueryDetection :: Property
+prop_partitionCliArgsQueryDetection =
+  forAll (elements
+    [ ("--dry-run", QueryDryRun)
+    , ("--numeric-version", QueryNumericVersion)
+    , ("--list-sources", QueryListSources)
+    , ("--only-configure", QueryOnlyConfigure)
+    , ("--only-download", QueryOnlyDownload)
+    ]) $ \(flag, expectedQuery) ->
+      case partitionCliArgs True [flag, "lib:buildr"] of
+        InvokeCabalQuery qtype args -> qtype == expectedQuery && flag `elem` args
+        _                           -> False
+
+-- | Property 35: Standalone and Cabal external command modes recognize all defined subcommands (§18).
+prop_partitionCliArgsSubcommands :: Property
+prop_partitionCliArgsSubcommands =
+  let subcases =
+        [ (["watch", "pkgA"], True)
+        , (["why", "ModuleA"], True)
+        , (["doctor"], True)
+        , (["stats"], True)
+        , (["theme", "list"], True)
+        , (["--version"], False)
+        ]
+  in property $ all (\(tokens, isSub) ->
+       let res1 = partitionCliArgs False tokens
+           res2 = partitionCliArgs True tokens
+       in case (res1, res2) of
+            (InvokeCommand _, InvokeCommand _) -> isSub
+            (InvokeVersion, InvokeVersion)     -> not isSub
+            _                                  -> False
+       ) subcases
+
 -- | Comprehensive integration and outlier suite for process group signals and terminal restoration.
 runSignalAndCancellationTests :: IO Bool
 runSignalAndCancellationTests = do
@@ -767,6 +858,71 @@ runTerminalAndResizeTests = do
     else putStrLn "  Dynamic terminal resizing & advanced VT sequence tests: FAIL"
   pure allOk
 
+-- | Comprehensive verification of native Cabal external command integration (§18).
+runCabalExternalCommandTests :: IO Bool
+runCabalExternalCommandTests = do
+  putStrLn "Running native Cabal external command integration tests (§18)..."
+
+  -- 1. Pure partition assertions on empty and flag-less invocations
+  let emptyPlugin = partitionCliArgs True []
+      emptyOk = case emptyPlugin of
+        InvokeCommand (CmdBuild opts) -> null (cboTargets opts) && null (cboCabalArgs opts)
+        _                             -> False
+
+  -- 2. Pure partition assertions on mixed options, targets, and cabal passthroughs
+  let mixed = partitionCliArgs True ["--view", "zen", "-j4", "lib:buildr", "--keep-going"]
+      mixedOk = case mixed of
+        InvokeCommand (CmdBuild opts) ->
+          cboViewMode opts == Just ViewZen
+          && cboKeepGoing opts == Just True
+          && cboTargets opts == ["lib:buildr"]
+          && cboCabalArgs opts == ["-j4"]
+        _ -> False
+
+  -- 3. Query flag detection
+  let dryRunInv = partitionCliArgs True ["--dry-run", "all"]
+      dryRunOk = case dryRunInv of
+        InvokeCabalQuery QueryDryRun args -> "--dry-run" `elem` args && "all" `elem` args
+        _                                 -> False
+
+  -- 4. Help and Version commands
+  let helpInv = partitionCliArgs True ["--help"]
+      versionInv = partitionCliArgs True ["--version"]
+      helpOk = helpInv == InvokeHelp Nothing
+      verOk = versionInv == InvokeVersion
+
+  -- 5. Subcommand routing
+  let docInv = partitionCliArgs True ["doctor"]
+      docOk = docInv == InvokeCommand CmdDoctor
+
+  -- 6. Live cabal-buildr execution via Cabal external command discovery
+  mCabalBuildr <- findExecutable "cabal-buildr"
+  liveCabalOk <- case mCabalBuildr of
+    Just _ -> do
+      (code, out, _) <- readProcessWithExitCode "cabal" ["buildr", "--help"] ""
+      pure (code == ExitSuccess && "buildr v" `isInfixOfStr` out)
+    Nothing -> do
+      let devPath = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/buildr-0.1.0.0/x/cabal-buildr/build/cabal-buildr"
+      exists <- doesDirectoryExist devPath
+      if exists
+        then do
+          absDevPath <- canonicalizePath devPath
+          curEnv <- getEnvironment
+          let curPath = fromMaybe "" (lookup "PATH" curEnv)
+              testEnv = ("PATH", absDevPath <> ":" <> curPath) : filter ((/= "PATH") . fst) curEnv
+              procTest = (proc "cabal" ["buildr", "--help"]) { env = Just testEnv }
+          (code, out, _) <- readCreateProcessWithExitCode procTest ""
+          pure (code == ExitSuccess && "buildr v" `isInfixOfStr` out)
+        else pure True
+
+  let allOk = emptyOk && mixedOk && dryRunOk && helpOk && verOk && docOk && liveCabalOk
+  if allOk
+    then putStrLn "  Native Cabal external command integration tests: PASS"
+    else putStrLn "  Native Cabal external command integration tests: FAIL"
+  pure allOk
+  where
+    isInfixOfStr sub str = T.isInfixOf (T.pack sub) (T.pack str)
+
 main :: IO ()
 main = do
   putStrLn "=========================================================="
@@ -779,6 +935,7 @@ main = do
   cfgOk <- runConfigTests
   sigOk <- runSignalAndCancellationTests
   termOk <- runTerminalAndResizeTests
+  cabalCmdOk <- runCabalExternalCommandTests
 
   res1 <- quickCheckResult (withNumTests 100 prop_eventJsonRoundTrip)
   res2 <- quickCheckResult (withNumTests 200 prop_barWidthRespectsBounds)
@@ -809,8 +966,14 @@ main = do
   res27 <- quickCheckResult (withNumTests 100 prop_formatUndercurl)
   res28 <- quickCheckResult (withNumTests 100 prop_formatOsc9Progress)
   res29 <- quickCheckResult (withNumTests 100 prop_formatDiagnosticWithCapsHonesty)
+  res30 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsCabalPluginDefaultsToBuild)
+  res31 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsRecognizesBuildrOptions)
+  res32 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsCabalPassthrough)
+  res33 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsDoubleDash)
+  res34 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsQueryDetection)
+  res35 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsSubcommands)
 
-  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk
+  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk && cabalCmdOk
                       && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
                       && isSuccess res7 && isSuccess res8 && isSuccess res9
@@ -820,7 +983,9 @@ main = do
                       && isSuccess res19 && isSuccess res20 && isSuccess res21
                       && isSuccess res22 && isSuccess res23 && isSuccess res24
                       && isSuccess res25 && isSuccess res26 && isSuccess res27
-                      && isSuccess res28 && isSuccess res29
+                      && isSuccess res28 && isSuccess res29 && isSuccess res30
+                      && isSuccess res31 && isSuccess res32 && isSuccess res33
+                      && isSuccess res34 && isSuccess res35
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

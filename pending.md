@@ -42,7 +42,7 @@ This document tracks pending implementation items, architectural enhancements, a
 
 ## 4. Native Cabal External Command Integration (§18)
 
-- [ ] **`cabal-buildr` Discovery**:
+- [x] **`cabal-buildr` Discovery**:
   - Provide an executable alias or symlink named `cabal-buildr` on `PATH`.
   - Enable invocation as a native Cabal external command:
     ```bash

@@ -36,6 +36,7 @@ common warnings
 library
     import:           warnings
     exposed-modules:
+        Buildr.Cli
         Buildr.Config
         Buildr.Core
         Buildr.Error
@@ -75,17 +76,16 @@ executable buildr
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N
     build-depends:
         base,
-        buildr,
-        async,
-        bytestring,
-        containers,
-        directory,
-        filepath,
-        optparse-applicative,
-        process,
-        terminal-size,
-        text,
-        unix
+        buildr
+
+executable cabal-buildr
+    import:           warnings
+    main-is:          CabalMain.hs
+    hs-source-dirs:   app
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+    build-depends:
+        base,
+        buildr
 
 executable buildr-ghc
     import:           warnings
