@@ -65,7 +65,17 @@ data Command
   | CmdTheme !ThemeOpts
   | CmdDoctor
 
-data BuildOpts = BuildOpts !ViewMode !Bool !(Maybe FilePath) ![String]
+data BuildOpts = BuildOpts
+  { boViewMode     :: !ViewMode
+  , boErrorStyle   :: !ErrorStyle
+  , boKeepGoing    :: !Bool
+  , boExplainHoles :: !Bool
+  , boJsonSink     :: !(Maybe FilePath)
+  , boRecordFile   :: !(Maybe FilePath)
+  , boThemeName    :: !(Maybe String)
+  , boTargets      :: ![String]
+  , boCabalArgs    :: ![String]
+  } deriving (Eq, Show)
 
 newtype WatchOpts = WatchOpts [String]
 data WhyOpts = WhyOpts !String !(Maybe String)
@@ -90,13 +100,32 @@ viewModeParser = option (eitherReader parseView)
       "linear" -> Right ViewLinear
       other    -> Left ("Unknown view: " <> other)
 
--- | CLI options parser for 'buildr build'.
+-- | Command-line option parser for diagnostic 'ErrorStyle' (§13, §18).
+errorStyleParser :: Parser ErrorStyle
+errorStyleParser = option (eitherReader parseStyle)
+  ( long "errors"
+ <> metavar "STYLE"
+ <> value ErrorClassic
+ <> help "Error diagnostic style: classic, friendly"
+  )
+  where
+    parseStyle = \case
+      "classic"  -> Right ErrorClassic
+      "friendly" -> Right ErrorFriendly
+      other      -> Left ("Unknown error style: " <> other)
+
+-- | CLI options parser for 'buildr build' (§18).
 buildOptsParser :: Parser Command
 buildOptsParser = CmdBuild <$> (BuildOpts
   <$> viewModeParser
+  <*> errorStyleParser
   <*> switch (long "keep-going" <> help "Continue compiling unaffected modules on error")
+  <*> switch (long "explain-holes" <> help "Automatically parse and suggest typed-hole candidates")
+  <*> optional (strOption (long "json" <> metavar "FILE|-" <> help "Stream JSON events to file or stdout"))
   <*> optional (strOption (long "record" <> metavar "FILE.jsonl" <> help "Record Event Protocol v1 stream to log file"))
-  <*> many (argument str (metavar "TARGETS...")))
+  <*> optional (strOption (long "theme" <> metavar "NAME" <> help "Terminal visual theme (e.g. rasika)"))
+  <*> many (argument str (metavar "TARGETS..."))
+  <*> many (strOption (long "cabal-arg" <> metavar "ARG" <> help "Passthrough arguments to cabal build")))
 
 -- | CLI options parser for 'buildr replay'.
 replayOptsParser :: Parser Command
@@ -147,20 +176,8 @@ runDoctor = do
   putStrLn "  Honesty check: 100% data trace verified"
 
   -- §15 hinsight exact version gate verification
-  mHin <- findExecutable "hinsight"
-  case mHin of
-    Nothing ->
-      putStrLn "  hinsight:      not installed (explanations disabled; core buildr functional)"
-    Just hinPath -> do
-      (hinCode, hinOut, _) <- readProcessWithExitCode hinPath ["--supported-ghc"] ""
-      if hinCode /= ExitSuccess
-        then putStrLn "  hinsight:      explanations unavailable"
-        else do
-          let hinSupported = safeFirstLine hinOut
-          if hinSupported == ghcVer
-            then putStrLn ("  hinsight gate: exact match verified (GHC " <> ghcVer <> ")")
-            else putStrLn ("  hinsight gate: unavailable (hinsight supports " <> hinSupported
-                            <> ", this project uses " <> ghcVer <> ")")
+  gate <- checkHinsightGate (T.pack ghcVer)
+  TIO.putStrLn ("  hinsight:      " <> formatGateNote gate)
   putStrLn "Environment is ready for buildr."
 
 -- | Replays a recorded Event Protocol v1 JSON log file through the pure model.
@@ -180,12 +197,12 @@ runReplay filePath viewMode = do
 
 -- | Live compilation orchestration: plans, sets up wrapper IPC, and renders progress.
 runBuild :: BuildOpts -> IO ()
-runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
+runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile _ targets cabalArgs) = do
   startNs <- getMonotonicTimeNSec
 
   -- 1. Discover build plan with cabal build --dry-run
   putStrLn "Discovering Cabal build plan..."
-  let dryRunArgs = ["build", "--dry-run"] <> targets
+  let dryRunArgs = ["build", "--dry-run"] <> targets <> cabalArgs
   (dryCode, _, dryErr) <- readProcessWithExitCode "cabal" dryRunArgs ""
   if dryCode /= ExitSuccess
     then do
@@ -205,12 +222,22 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
           graphEvents <- discoverLocalUnitGraphs units
           let m1 = foldEvents m0 graphEvents
 
-          case recordFile of
-            Just path -> do
-              createDirectoryIfMissing True (takeDirectory path)
-              BS.appendFile path (encodeEventLine planEvent <> "\n")
-              mapM_ (\ge -> BS.appendFile path (encodeEventLine ge <> "\n")) graphEvents
-            Nothing -> pure ()
+          let logEvent ev = do
+                let enc = encodeEventLine ev <> "\n"
+                case recordFile of
+                  Just path -> do
+                    createDirectoryIfMissing True (takeDirectory path)
+                    BS.appendFile path enc
+                  Nothing -> pure ()
+                case jsonSink of
+                  Just "-"  -> BS.putStr enc >> hFlush stdout
+                  Just path -> do
+                    createDirectoryIfMissing True (takeDirectory path)
+                    BS.appendFile path enc
+                  Nothing   -> pure ()
+
+          logEvent planEvent
+          mapM_ logEvent graphEvents
           modelVar <- newMVar m1
 
           -- Setup persistent history
@@ -250,7 +277,7 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
               pure ()
             Nothing -> pure ()
 
-          bracket (startIpcServer sockPath (onIpcEvent modelVar cacheVar recordFile)) cleanupServer $ \case
+          bracket (startIpcServer sockPath (onIpcEvent modelVar cacheVar recordFile jsonSink explainHoles)) cleanupServer $ \case
             Left ipcErr -> do
               TIO.putStrLn (describeError (BuildrIpcError ipcErr))
               exitFailure
@@ -261,7 +288,7 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
               -- 3. Run live display loop in background
               renderThread <- forkIO (liveRenderLoop modelVar tuiVar)
 
-              -- 3b. Interactive keyboard input loop if attached to a terminal (§12.6)
+              -- 3b. Interactive keyboard input loop if attached to a terminal (§12.6, §14, §15)
               mInputThread <- if isTty && viewMode /= ViewPlain
                 then do
                   hSetBuffering stdin NoBuffering
@@ -272,10 +299,11 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
               -- 4. Invoke cabal build passing wrapper and BUILDR_SOCKET
               curEnv <- getEnvironment
               let buildrEnv = ("BUILDR_SOCKET", sockPath) : curEnv
-                  cabalArgs = [ "build", "-w", ghcLink ]
-                           <> [ "--keep-going" | keepGoing ]
-                           <> targets
-                  cabalProc = (proc "cabal" cabalArgs)
+                  cabalArgsAll = [ "build", "-w", ghcLink ]
+                              <> [ "--keep-going" | keepGoing ]
+                              <> targets
+                              <> cabalArgs
+                  cabalProc = (proc "cabal" cabalArgsAll)
                     { env     = Just buildrEnv
                     , std_in  = Inherit
                     , std_out = CreatePipe
@@ -285,7 +313,7 @@ runBuild (BuildOpts viewMode keepGoing recordFile targets) = do
               bracket_ (unless (viewMode == ViewPlain) (putStr "\ESC[?25l"))
                        (unless (viewMode == ViewPlain) (putStr "\ESC[?25h\n")) $ do
                 (_, Just hOut, _, ph) <- createProcess cabalProc
-                cabalWorker <- async (readCabalStdout hOut modelVar cacheVar recordFile viewMode)
+                cabalWorker <- async (readCabalStdout hOut modelVar cacheVar recordFile jsonSink explainHoles viewMode errStyle)
                 code <- waitForProcess ph
                 wait cabalWorker
                 endNs <- getMonotonicTimeNSec
@@ -336,8 +364,8 @@ discoverLocalUnitGraphs units = do
         [] -> pure []
 
 -- | Concurrently reads Cabal stdout, streaming to console in plain view and updating lifecycle state.
-readCabalStdout :: Handle -> MVar BuildModel -> MVar HistoryCache -> Maybe FilePath -> ViewMode -> IO ()
-readCabalStdout hOut modelVar cacheVar maybeLogPath viewMode = do
+readCabalStdout :: Handle -> MVar BuildModel -> MVar HistoryCache -> Maybe FilePath -> Maybe FilePath -> Bool -> ViewMode -> ErrorStyle -> IO ()
+readCabalStdout hOut modelVar cacheVar maybeLogPath maybeJsonPath explainHoles viewMode errStyle = do
   eof <- hIsEOF hOut
   unless eof $ do
     line <- TIO.hGetLine hOut
@@ -348,24 +376,39 @@ readCabalStdout hOut modelVar cacheVar maybeLogPath viewMode = do
       Just payload -> do
         nowNs <- getMonotonicTimeNSec
         let ev = mkEvent 0 (fromIntegral nowNs :: Int64) SrcCabal ValueObserved payload
-        onIpcEvent modelVar cacheVar maybeLogPath ev
+        onIpcEvent modelVar cacheVar maybeLogPath maybeJsonPath explainHoles ev
       Nothing -> pure ()
-    readCabalStdout hOut modelVar cacheVar maybeLogPath viewMode
+    readCabalStdout hOut modelVar cacheVar maybeLogPath maybeJsonPath explainHoles viewMode errStyle
 
 -- | Handler updating model MVar and history cache upon receiving an event from wrapper over IPC.
-onIpcEvent :: MVar BuildModel -> MVar HistoryCache -> Maybe FilePath -> Event -> IO ()
-onIpcEvent modelVar cacheVar maybeLogPath ev = do
+onIpcEvent :: MVar BuildModel -> MVar HistoryCache -> Maybe FilePath -> Maybe FilePath -> Bool -> Event -> IO ()
+onIpcEvent modelVar cacheVar maybeLogPath maybeJsonPath explainHoles ev = do
   modifyMVar_ modelVar (\m -> pure (applyEvent m ev))
   case eventPayload ev of
     PayloadModuleFinished uid modName -> do
       pwd <- getCurrentDirectory
       let key = HistoryKey pwd uid modName "9.10.3" "3.16.1.0" "-O1"
       modifyMVar_ cacheVar (\c -> pure (insertTiming key 100 1024 c))
+    PayloadDiagnostic _ diag | explainHoles -> do
+      let fits = parseHoleFits (diagMessage diag <> diagHints diag)
+      unless (null fits) $ do
+        TIO.putStrLn ("\n  [Typed-hole suggestions for " <> T.pack (spanFile (diagSpan diag)) <> ":]")
+        mapM_ (\f -> TIO.putStrLn ("    [" <> T.pack (show (hfIndex f)) <> "] " <> hfExpr f <> " :: " <> hfType f)) fits
+        hFlush stdout
     _ -> pure ()
+  let encoded = encodeEventLine ev <> "\n"
   case maybeLogPath of
     Just path -> do
       createDirectoryIfMissing True (takeDirectory path)
-      BS.appendFile path (encodeEventLine ev <> "\n")
+      BS.appendFile path encoded
+    Nothing   -> pure ()
+  case maybeJsonPath of
+    Just "-"  -> do
+      BS.putStr encoded
+      hFlush stdout
+    Just path -> do
+      createDirectoryIfMissing True (takeDirectory path)
+      BS.appendFile path encoded
     Nothing   -> pure ()
 
 -- | State record tracking interactive TTY view settings and navigation (§12.6).
@@ -412,7 +455,7 @@ readKey = do
            then pure KeyEnter
            else pure (KeyChar c)
 
--- | Interactive key event loop (§12.6: g/m/z view, t warnings, ↑/↓ navigation, e editor, q detach).
+-- | Interactive key event loop (§12.6: g/m/z view, t warnings, ↑/↓ navigation, x explain, 1-9 fits, e editor, q detach).
 interactiveInputLoop :: MVar TuiState -> MVar BuildModel -> IO ()
 interactiveInputLoop tuiVar modelVar = forever $ do
   key <- readKey
@@ -427,6 +470,40 @@ interactiveInputLoop tuiVar modelVar = forever $ do
       hFlush stdout
     KeyUp       -> modifyMVar_ tuiVar (\s -> pure s { tsSelectedRow = max 0 (tsSelectedRow s - 1) })
     KeyDown     -> modifyMVar_ tuiVar (\s -> pure s { tsSelectedRow = tsSelectedRow s + 1 })
+    KeyChar 'x' -> do
+      m <- readMVar modelVar
+      case bmDiagnostics m of
+        (d:_) -> do
+          putStrLn "\n--- On-Demand Error Explanation (§14, §15) ---"
+          gate <- checkHinsightGate "9.10.3"
+          res <- requestExplanation gate d
+          case res of
+            Left err   -> TIO.putStrLn ("  " <> err)
+            Right expl -> TIO.putStr (formatExplanation expl)
+          hFlush stdout
+        [] -> do
+          putStrLn "\nbuildr: no compiler errors or typed holes to explain."
+          hFlush stdout
+    KeyChar c | c >= '1' && c <= '9' -> do
+      let idx = fromEnum c - fromEnum '0'
+      m <- readMVar modelVar
+      case bmDiagnostics m of
+        (d:_) -> do
+          let fits = parseHoleFits (diagMessage d <> diagHints d)
+              matchingFit = [ f | f <- fits, hfIndex f == idx ]
+          case matchingFit of
+            (fit:_) -> do
+              applyRes <- applyHoleFitToFile (spanFile (diagSpan d)) (diagSpan d) fit
+              case applyRes of
+                Right () -> do
+                  putStrLn ("\nbuildr: applied typed-hole suggestion [" <> show idx <> "] "
+                             <> T.unpack (hfExpr fit) <> " to " <> spanFile (diagSpan d))
+                  hFlush stdout
+                Left err -> do
+                  putStrLn ("\nbuildr: failed to apply typed-hole suggestion: " <> T.unpack err)
+                  hFlush stdout
+            [] -> pure ()
+        [] -> pure ()
     KeyChar 'e' -> do
       m <- readMVar modelVar
       let diags = bmDiagnostics m
@@ -459,7 +536,7 @@ runWatch :: [String] -> IO ()
 runWatch targets = do
   putStrLn "buildr watch: starting continuous rebuild loop..."
   putStrLn ("Monitoring workspace for targets: " <> unwords targets)
-  runBuild (BuildOpts ViewZen True Nothing targets)
+  runBuild (BuildOpts ViewZen ErrorClassic True False Nothing Nothing Nothing targets [])
 
 -- | Why mode showing rebuild reasons and interface diffs (§14, §18).
 runWhy :: String -> Maybe String -> IO ()

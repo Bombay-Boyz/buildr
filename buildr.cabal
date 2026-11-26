@@ -41,6 +41,7 @@ library
         Buildr.Event
         Buildr.Grammar
         Buildr.Graph
+        Buildr.Hinsight
         Buildr.History
         Buildr.Ipc
         Buildr.Model

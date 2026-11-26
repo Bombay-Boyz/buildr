@@ -76,8 +76,8 @@ renderGraphViewSelected mSel model =
                      else ["  ▸ " <> T.pack (show (length inactiveUnits)) <> " dependencies planned/waiting"]
       footer = "Overall: " <> renderOverallBar model
       helpLine = case mSel of
-        Just idx -> ["  [Keys: ↑/↓ select (row " <> T.pack (show idx) <> ") | g/m/z view | t warnings | e edit | q detach]"]
-        Nothing  -> ["  [Keys: g/m/z view | t warnings | ↑/↓ select | q detach]"]
+        Just idx -> ["  [Keys: ↑/↓ select (row " <> T.pack (show idx) <> ") | g/m/z view | t warnings | x explain | 1-9 fits | e edit | q detach]"]
+        Nothing  -> ["  [Keys: g/m/z view | t warnings | x explain | 1-9 fits | ↑/↓ select | q detach]"]
   in T.unlines
        ( [ "=== buildr: Graph Frontier (Units: " <> T.pack (show totalUnits)
              <> " | Slots: " <> T.pack (show (bmBusySlots model)) <> "/"

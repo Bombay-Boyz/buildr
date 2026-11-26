@@ -179,6 +179,33 @@ prop_kahnTopologicalSortValid =
         []         -> Nothing
   in property (idxOf "ModC" < idxOf "ModB" && idxOf "ModB" < idxOf "ModA")
 
+-- | Property 12: HinsightGate JSON serialization round-trips losslessly (§15).
+prop_hinsightGateJsonRoundTrip :: Property
+prop_hinsightGateJsonRoundTrip = forAll genGate $ \gate ->
+  Aeson.decode (Aeson.encode gate) == Just gate
+  where
+    genGate = oneof
+      [ GateMatched <$> elements ["9.10.3", "9.12.1"]
+      , GateMismatched <$> elements ["9.10.3"] <*> elements ["9.12.1", "9.8.2"]
+      , pure GateMissing
+      , GateFailed <$> elements ["hinsight crashed", "permission denied"]
+      ]
+
+-- | Property 13: HoleFit JSON serialization round-trips losslessly (§14, §15).
+prop_holeFitJsonRoundTrip :: Property
+prop_holeFitJsonRoundTrip = forAll genFit $ \fit ->
+  Aeson.decode (Aeson.encode fit) == Just fit
+  where
+    genFit = HoleFit <$> choose (1, 9) <*> elements ["[]", "id", "head"] <*> elements ["[a]", "a -> a", "[a] -> a"]
+
+-- | Property 14: Diagnostic formatting preserves GHC message text verbatim in all styles (§6, §13).
+prop_errorStyleHonestyPreserved :: Property
+prop_errorStyleHonestyPreserved = forAll genDiagnosticPayload $ \diag ->
+  let classic = formatDiagnosticWithStyle ErrorClassic diag
+      friendly = formatDiagnosticWithStyle ErrorFriendly diag
+      allMsgsIn fmt = all (`T.isInfixOf` fmt) (diagMessage diag)
+  in allMsgsIn classic && allMsgsIn friendly
+
 -- | Tests Plan JSON parser functionality on edge cases and live plan.json.
 runPlanTests :: IO Bool
 runPlanTests = do
@@ -347,9 +374,46 @@ runBoundaryTests = do
                  && T.isInfixOf "Interface change detected in upstream dependency 'ModA'" formattedWhy
                  && T.isInfixOf "Out of date: foo" formattedWhy
 
+      -- Typed hole parsing & explanation formatting tests (§14, §15)
+      sampleHoleMsg = T.unlines
+        [ "Found hole: _ :: [Int]"
+        , "Where: `_` is a rigid type variable"
+        , "Valid hole fits include"
+        , "  [] :: [Int]"
+        , "  [1, 2] :: [Int]"
+        , "  (reverse [1]) :: [Int] (bound at src/Main.hs:12:3)"
+        ]
+      parsedHoleFits = parseHoleFitsFromText sampleHoleMsg
+      holeFitOk = case parsedHoleFits of
+        (f1:_:f3:_) -> hfExpr f1 == "[]"
+                    && hfType f1 == "[Int]"
+                    && hfIndex f1 == 1
+                    && hfExpr f3 == "(reverse [1])"
+        _           -> False
+      sampleExpl = DiagnosticExplanation (SourceSpan "src/Main.hs" 5 10 5 11) (Just 88464) "Found hole _ :: [Int]" parsedHoleFits Nothing
+      formattedExpl = formatExplanation sampleExpl
+      explOk = T.isInfixOf "[Explanation (GHC-88464)]" formattedExpl
+            && T.isInfixOf "Typed-hole suggestions (press 1-9 to accept):" formattedExpl
+            && T.isInfixOf "[1] [] :: [Int]" formattedExpl
+
+      -- Version gate note formatting tests (§6, §15)
+      gateMatchNote = formatGateNote (GateMatched "9.10.3") == "hinsight ready (exact match: GHC 9.10.3)"
+      gateMismatchNote = formatGateNote (GateMismatched "9.10.3" "9.12.1") == "explanations unavailable: hinsight supports GHC 9.10.3, this project uses 9.12.1"
+      gateMissingNote = formatGateNote GateMissing == "explanations unavailable: hinsight not found on PATH"
+      gateNotesOk = gateMatchNote && gateMismatchNote && gateMissingNote
+
+      -- Friendly vs classic error style formatting tests (§13, §18)
+      friendlyFmt = case parsedDiag of
+        Just d  -> formatDiagnosticWithStyle ErrorFriendly d
+        Nothing -> ""
+      friendlyFmtOk = T.isInfixOf "┌─ ERROR [GHC-39999]" friendlyFmt
+                   && T.isInfixOf "Location: src/Core.hs:10:5" friendlyFmt
+                   && T.isInfixOf "No instance for `Num String'" friendlyFmt
+                   && T.isInfixOf "• Suggestion: Add instance" friendlyFmt
+
       boundaryOk = zeroBarOk && largeBarOk && emptyModelOk && singleModDone && ciGroupOk && t1Ok && c1Ok && c2Ok
                 && diagParsedOk && diagFormatOk && srcGraphOk && kahnValid && modHeaderOk && modImportsOk
-                && hiDiffOk && whyFormatOk
+                && hiDiffOk && whyFormatOk && holeFitOk && explOk && gateNotesOk && friendlyFmtOk
   if boundaryOk
     then do
       putStrLn "  Boundary outlier tests: PASS"
@@ -414,10 +478,14 @@ main = do
   res9 <- quickCheckResult (withNumTests 100 prop_historyCacheJsonRoundTrip)
   res10 <- quickCheckResult (withNumTests 100 prop_diagnosticJsonRoundTrip)
   res11 <- quickCheckResult (withNumTests 50 prop_kahnTopologicalSortValid)
+  res12 <- quickCheckResult (withNumTests 50 prop_hinsightGateJsonRoundTrip)
+  res13 <- quickCheckResult (withNumTests 50 prop_holeFitJsonRoundTrip)
+  res14 <- quickCheckResult (withNumTests 100 prop_errorStyleHonestyPreserved)
 
   let allPassed = bOk && planOk && ipcOk && goldenOk && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
                       && isSuccess res7 && isSuccess res8 && isSuccess res9 && isSuccess res10 && isSuccess res11
+                      && isSuccess res12 && isSuccess res13 && isSuccess res14
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

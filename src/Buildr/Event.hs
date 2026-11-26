@@ -33,10 +33,12 @@ module Buildr.Event
   , encodeEventLine
   , decodeEventLine
     -- * Stream Recognisers & Diagnostic Formatting (§13, §22 G4, G5)
+  , ErrorStyle (..)
   , parseTimingLine
   , parseCabalLifecycleLine
   , parseGhcDiagnosticJson
   , formatDiagnostic
+  , formatDiagnosticWithStyle
   ) where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?), (.=), object, withObject, encode, decodeStrict)
@@ -504,10 +506,24 @@ parseGhcDiagnosticJson txt =
          Just raw -> Just (rawGhcToPayload raw)
          Nothing  -> Nothing
 
--- | Formats a GHC diagnostic according to Visual Grammar v1 and §13:
+-- | Diagnostic layout formatting style (§13, §18).
+data ErrorStyle
+  = ErrorClassic
+  | ErrorFriendly
+  deriving (Eq, Show, Generic)
+
+instance FromJSON ErrorStyle
+instance ToJSON ErrorStyle
+
+-- | Formats a GHC diagnostic according to Visual Grammar v1 and §13 using classic style:
 -- Header with clickable location, severity, error code, warning flag, verbatim message lines, and derived doc links.
 formatDiagnostic :: DiagnosticPayload -> Text
-formatDiagnostic diag =
+formatDiagnostic = formatDiagnosticWithStyle ErrorClassic
+
+-- | Formats a GHC diagnostic using the requested 'ErrorStyle' (§13, §18).
+-- The friendly layout rearranges GHC's fields with clear sectioning without ever rewording message content.
+formatDiagnosticWithStyle :: ErrorStyle -> DiagnosticPayload -> Text
+formatDiagnosticWithStyle ErrorClassic diag =
   let span' = diagSpan diag
       loc = T.pack (spanFile span') <> ":" <> T.pack (show (spanStartLine span')) <> ":" <> T.pack (show (spanStartCol span'))
       sevStr = case diagSeverity diag of
@@ -527,3 +543,27 @@ formatDiagnostic diag =
         Just c  -> ["    • Documentation: https://errors.haskell.org/messages/GHC-" <> T.pack (show c) <> " (derived)"]
         Nothing -> []
   in T.unlines ([header] <> msgLines <> hintLines <> docLine)
+formatDiagnosticWithStyle ErrorFriendly diag =
+  let span' = diagSpan diag
+      sevStr = case diagSeverity diag of
+        SeverityError   -> "ERROR"
+        SeverityWarning -> "WARNING"
+        SeverityInfo    -> "INFO"
+      codeStr = case diagCode diag of
+        Just c  -> " [GHC-" <> T.pack (show c) <> "]"
+        Nothing -> ""
+      flagStr = case diagFlag diag of
+        Just f  -> " [" <> f <> "]"
+        Nothing -> ""
+      header = "┌─ " <> sevStr <> codeStr <> flagStr <> "\n"
+            <> "│  Location: " <> T.pack (spanFile span') <> ":" <> T.pack (show (spanStartLine span')) <> ":" <> T.pack (show (spanStartCol span')) <> "\n"
+            <> "│"
+      msgLines = map ("│  " <>) (diagMessage diag)
+      hintLines = if null (diagHints diag)
+                    then []
+                    else "│" : map (\h -> "│  • Suggestion: " <> h) (diagHints diag)
+      docLine = case diagCode diag of
+        Just c  -> ["│  • Error docs: https://errors.haskell.org/messages/GHC-" <> T.pack (show c) <> " (derived)"]
+        Nothing -> []
+      footer = "└─────────────────────────────────────────────────────────────"
+  in T.unlines ([header] <> msgLines <> hintLines <> docLine <> [footer])

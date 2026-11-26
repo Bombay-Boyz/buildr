@@ -11,6 +11,7 @@ module Buildr.Core
   , module Buildr.Event
   , module Buildr.Grammar
   , module Buildr.Graph
+  , module Buildr.Hinsight
   , module Buildr.History
   , module Buildr.Ipc
   , module Buildr.Model
@@ -25,6 +26,7 @@ import Buildr.Error
 import Buildr.Event
 import Buildr.Grammar
 import Buildr.Graph
+import Buildr.Hinsight
 import Buildr.History
 import Buildr.Ipc
 import Buildr.Model
