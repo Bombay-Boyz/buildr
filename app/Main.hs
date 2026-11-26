@@ -10,7 +10,7 @@ module Main (main) where
 import Buildr.Core
 import Control.Concurrent (MVar, forkIO, killThread, modifyMVar_, newMVar, readMVar, threadDelay)
 import Control.Concurrent.Async (async, wait)
-import Control.Exception (bracket, bracket_)
+import Control.Exception (IOException, bracket, catch)
 import Control.Monad (filterM, forever, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
@@ -34,14 +34,11 @@ import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import System.FilePath (takeDirectory, (</>))
 import System.IO
-  ( BufferMode (..)
-  , Handle
+  ( Handle
   , hFlush
   , hIsEOF
   , hIsTerminalDevice
   , hReady
-  , hSetBuffering
-  , hSetEcho
   , stdin
   , stdout
   )
@@ -338,56 +335,74 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
               isTty <- hIsTerminalDevice stdin
               tuiVar <- newMVar (TuiState viewMode True 0 False)
 
-              -- 3. Run live display loop in background
-              renderThread <- forkIO (liveRenderLoop modelVar tuiVar)
+              -- Guarantee terminal restoration under all exit paths (§20)
+              withTerminalRestored (isTty && viewMode /= ViewPlain) $ do
+                -- 3. Run live display loop in background
+                bracket (forkIO (liveRenderLoop modelVar tuiVar)) killThread $ \_renderThread -> do
+                  -- 3b. Interactive keyboard input loop if attached to a terminal (§12.6, §14, §15)
+                  bracket (if isTty && viewMode /= ViewPlain
+                             then Just <$> forkIO (interactiveInputLoop tuiVar modelVar)
+                             else pure Nothing)
+                          (\mIn -> case mIn of Just inTid -> killThread inTid; Nothing -> pure ()) $ \_ -> do
 
-              -- 3b. Interactive keyboard input loop if attached to a terminal (§12.6, §14, §15)
-              mInputThread <- if isTty && viewMode /= ViewPlain
-                then do
-                  hSetBuffering stdin NoBuffering
-                  hSetEcho stdin False
-                  Just <$> forkIO (interactiveInputLoop tuiVar modelVar)
-                else pure Nothing
+                    -- 4. Invoke cabal build passing wrapper and BUILDR_SOCKET
+                    curEnv <- getEnvironment
+                    let buildrEnv = ("BUILDR_SOCKET", sockPath) : curEnv
+                        cabalArgsAll = [ "build", "-w", ghcLink ]
+                                    <> [ "--keep-going" | keepGoing ]
+                                    <> targets
+                                    <> cabalArgs
+                        cabalProc = (proc "cabal" cabalArgsAll)
+                          { env          = Just buildrEnv
+                          , std_in       = Inherit
+                          , std_out      = CreatePipe
+                          , std_err      = Inherit
+                          , create_group = True
+                          }
 
-              -- 4. Invoke cabal build passing wrapper and BUILDR_SOCKET
-              curEnv <- getEnvironment
-              let buildrEnv = ("BUILDR_SOCKET", sockPath) : curEnv
-                  cabalArgsAll = [ "build", "-w", ghcLink ]
-                              <> [ "--keep-going" | keepGoing ]
-                              <> targets
-                              <> cabalArgs
-                  cabalProc = (proc "cabal" cabalArgsAll)
-                    { env     = Just buildrEnv
-                    , std_in  = Inherit
-                    , std_out = CreatePipe
-                    , std_err = Inherit
-                    }
+                    let renderCancellation ph = do
+                          nowNs <- getMonotonicTimeNSec
+                          let totalWallNs = fromIntegral (nowNs - startNs) :: Int64
+                          m <- readMVar modelVar
+                          TIO.putStr (formatCancellationSummary m totalWallNs)
+                          hFlush stdout
+                          forwardAbortSignals ph
 
-              bracket_ (unless (viewMode == ViewPlain) (putStr "\ESC[?25l"))
-                       (unless (viewMode == ViewPlain) (putStr "\ESC[?25h\n")) $ do
-                (_, Just hOut, _, ph) <- createProcess cabalProc
-                cabalWorker <- async (readCabalStdout hOut modelVar cacheVar recordFile jsonSink explainHoles viewMode errStyle)
-                code <- waitForProcess ph
-                wait cabalWorker
-                endNs <- getMonotonicTimeNSec
+                    bracket (createProcess cabalProc) (\(_, _, _, ph) -> forwardAbortSignals ph) $ \case
+                      (_, Just hOut, _, ph) -> do
+                        cabalWorker <- async (readCabalStdout hOut modelVar cacheVar recordFile jsonSink explainHoles viewMode errStyle)
+                        let onAbort = renderCancellation ph
+                        code <- (withProcessGroupSignals ph onAbort (waitForProcess ph)) `catch` \(_ :: IOException) -> do
+                          onAbort
+                          exitWith (ExitFailure 130)
+                        wait cabalWorker
+                        endNs <- getMonotonicTimeNSec
 
-                -- 5. Finalize rendering & restore terminal
-                case mInputThread of
-                  Just inTid -> do
-                    killThread inTid
-                    hSetEcho stdin True
-                    hSetBuffering stdin LineBuffering
-                  Nothing -> pure ()
-                killThread renderThread
-                stopIpcServer serverHandle
-                finalModel <- readMVar modelVar
-                finalCache <- readMVar cacheVar
-                _ <- saveHistoryCache histPath finalCache
+                        stopIpcServer serverHandle
+                        finalModel <- readMVar modelVar
+                        finalCache <- readMVar cacheVar
+                        _ <- saveHistoryCache histPath finalCache
 
-                let totalWallNs = fromIntegral (endNs - startNs) :: Int64
-                unless (viewMode == ViewZen) $ do
-                  TIO.putStr (renderSummaryBlock finalModel totalWallNs)
-                exitWith code
+                        let totalWallNs = fromIntegral (endNs - startNs) :: Int64
+                        unless (viewMode == ViewZen) $ do
+                          TIO.putStr (renderSummaryBlock finalModel totalWallNs)
+                        exitWith code
+                      (_, Nothing, _, ph) -> do
+                        let onAbort = renderCancellation ph
+                        code <- (withProcessGroupSignals ph onAbort (waitForProcess ph)) `catch` \(_ :: IOException) -> do
+                          onAbort
+                          exitWith (ExitFailure 130)
+                        endNs <- getMonotonicTimeNSec
+
+                        stopIpcServer serverHandle
+                        finalModel <- readMVar modelVar
+                        finalCache <- readMVar cacheVar
+                        _ <- saveHistoryCache histPath finalCache
+
+                        let totalWallNs = fromIntegral (endNs - startNs) :: Int64
+                        unless (viewMode == ViewZen) $ do
+                          TIO.putStr (renderSummaryBlock finalModel totalWallNs)
+                        exitWith code
   where
     cleanupServer _ = pure ()
 

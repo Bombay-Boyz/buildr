@@ -47,6 +47,7 @@ library
         Buildr.Ipc
         Buildr.Model
         Buildr.Plan
+        Buildr.Signal
         Buildr.Theme
         Buildr.View
     hs-source-dirs:   src
@@ -63,7 +64,8 @@ library
         process >=1.6 && <1.7,
         terminal-size >=0.3 && <0.4,
         text >=2.0 && <2.2,
-        time >=1.11 && <1.15
+        time >=1.11 && <1.15,
+        unix >=2.8 && <2.9
 
 executable buildr
     import:           warnings
@@ -80,7 +82,8 @@ executable buildr
         filepath,
         optparse-applicative,
         process,
-        text
+        text,
+        unix
 
 executable buildr-ghc
     import:           warnings
@@ -94,6 +97,7 @@ executable buildr-ghc
         network,
         process,
         text,
+        unix,
         time
 
 test-suite buildr-test
@@ -110,5 +114,7 @@ test-suite buildr-test
         containers,
         directory,
         filepath,
+        process,
         QuickCheck >=2.14 && <2.20,
-        text
+        text,
+        unix

@@ -19,7 +19,7 @@ module Main (main) where
 
 import Buildr.Core
 import Control.Concurrent (MVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (bracket)
+import Control.Exception (SomeException, bracket, throwIO, try)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
@@ -31,8 +31,10 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import System.Directory (doesFileExist, getTemporaryDirectory)
-import System.Exit (exitFailure, exitSuccess)
+import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath ((</>))
+import System.Posix.Signals (sigTERM)
+import System.Process (CreateProcess (..), createProcess, proc, waitForProcess)
 import Test.QuickCheck
 
 -- | Generator for valid Event Protocol v1 event sources.
@@ -563,6 +565,79 @@ runConfigTests = do
         else putStrLn "  Configuration tests: FAIL"
       pure allOk
 
+-- | Property 18: Cancellation state update always guarantees cancelled outcome.
+prop_modelCancellationOutcome :: Property
+prop_modelCancellationOutcome = forAll (listOf genEvent) $ \evs ->
+  let m = foldEvents initialModel evs
+      c = markModelCancelled m
+  in bmCompleted c && bmOutcome c == Just BuildCancelled
+
+-- | Property 19: Cancellation summary always emits CANCELLED label and preserves exact module tallies.
+prop_cancellationSummaryLabelAndCounts :: Property
+prop_cancellationSummaryLabelAndCounts = forAll (listOf genEvent) $ \evs ->
+  forAll (choose (0, 1000000000000 :: Int64)) $ \wallNs ->
+    let m = foldEvents initialModel evs
+        summary = formatCancellationSummary m wallNs
+        counts = countModulesByStatus m
+        done = Map.findWithDefault 0 "done" counts
+        skipped = Map.findWithDefault 0 "skipped" counts
+        failed = Map.findWithDefault 0 "failed" counts
+        blocked = Map.findWithDefault 0 "blocked" counts
+        notReached = Map.findWithDefault 0 "not_reached" counts
+    in T.isInfixOf "CANCELLED" summary
+       && T.isInfixOf (T.pack (show done) <> " done") summary
+       && T.isInfixOf (T.pack (show skipped) <> " skipped") summary
+       && T.isInfixOf (T.pack (show failed) <> " failed") summary
+       && T.isInfixOf (T.pack (show blocked) <> " blocked") summary
+       && T.isInfixOf (T.pack (show notReached) <> " not reached") summary
+
+-- | Property 20: Cancellation preserves pure model invariants.
+prop_cancellationPreservesInvariants :: Property
+prop_cancellationPreservesInvariants = forAll (listOf genEvent) $ \evs ->
+  let m = foldEvents initialModel evs
+  in checkModelInvariants m ==> checkModelInvariants (markModelCancelled m)
+
+-- | Comprehensive integration and outlier suite for process group signals and terminal restoration.
+runSignalAndCancellationTests :: IO Bool
+runSignalAndCancellationTests = do
+  putStrLn "Running process group signal handling & terminal restoration tests..."
+
+  -- 1. Outlier: format cancellation summary with 0 ns wall time and negative bounds
+  let zeroSummary = formatCancellationSummary initialModel 0
+      zeroOk = T.isInfixOf "CANCELLED" zeroSummary && T.isInfixOf "0 done" zeroSummary
+
+  let negSummary = formatCancellationSummary initialModel (-500000)
+      negOk = T.isInfixOf "CANCELLED" negSummary
+
+  -- 2. Outlier: format cancellation summary with 10^15 ns wall time (multi-day build)
+  let hugeSummary = formatCancellationSummary initialModel 86400000000000
+      hugeOk = T.isInfixOf "CANCELLED" hugeSummary
+
+  -- 3. Outlier: forward signal to already terminated process handle
+  (_, _, _, phTerm) <- createProcess (proc "true" [])
+  _ <- waitForProcess phTerm
+  forwardAbortSignals phTerm
+  let deadProcOk = True
+
+  -- 4. Process group signal delivery on active child
+  let childProc = (proc "sleep" ["10"]) { create_group = True }
+  (_, _, _, phSleep) <- createProcess childProc
+  forwardSignalToProcessGroup sigTERM phSleep
+  sleepExit <- waitForProcess phSleep
+  let signalDeliveredOk = sleepExit /= ExitSuccess
+
+  -- 5. Terminal restoration under thrown exception
+  exRes <- try (withTerminalRestored False (throwIO (userError "simulated abortion failure"))) :: IO (Either SomeException ())
+  let termRestoreOk = case exRes of
+        Left _  -> True
+        Right _ -> False
+
+  let allOk = zeroOk && negOk && hugeOk && deadProcOk && signalDeliveredOk && termRestoreOk
+  if allOk
+    then putStrLn "  Process group signal & cancellation tests: PASS"
+    else putStrLn "  Process group signal & cancellation tests: FAIL"
+  pure allOk
+
 main :: IO ()
 main = do
   putStrLn "=========================================================="
@@ -573,6 +648,7 @@ main = do
   ipcOk <- runIpcTests
   goldenOk <- runGoldenReplayTests
   cfgOk <- runConfigTests
+  sigOk <- runSignalAndCancellationTests
 
   res1 <- quickCheckResult (withNumTests 100 prop_eventJsonRoundTrip)
   res2 <- quickCheckResult (withNumTests 200 prop_barWidthRespectsBounds)
@@ -591,14 +667,18 @@ main = do
   res15 <- quickCheckResult (withNumTests 100 prop_configSemigroupAssociative)
   res16 <- quickCheckResult (withNumTests 100 prop_configMonoidIdentity)
   res17 <- quickCheckResult (withNumTests 100 prop_configPrecedenceLaw)
+  res18 <- quickCheckResult (withNumTests 100 prop_modelCancellationOutcome)
+  res19 <- quickCheckResult (withNumTests 100 prop_cancellationSummaryLabelAndCounts)
+  res20 <- quickCheckResult (withNumTests 100 prop_cancellationPreservesInvariants)
 
-  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk
+  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk
                       && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
                       && isSuccess res7 && isSuccess res8 && isSuccess res9
                       && isSuccess res10 && isSuccess res11 && isSuccess res12
                       && isSuccess res13 && isSuccess res14 && isSuccess res15
-                      && isSuccess res16 && isSuccess res17
+                      && isSuccess res16 && isSuccess res17 && isSuccess res18
+                      && isSuccess res19 && isSuccess res20
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

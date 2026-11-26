@@ -17,12 +17,12 @@ This document tracks pending implementation items, architectural enhancements, a
 
 ## 2. Process Group Signal Handling & Graceful Cancellation (§20)
 
-- [ ] **Process Group Signal Forwarding**:
+- [x] **Process Group Signal Forwarding**:
   - Intercept `SIGINT` (Ctrl+C) and `SIGTERM` signals in the main orchestrator process.
   - Forward signals directly to the Cabal child process group to guarantee no orphaned compiler processes remain.
-- [ ] **Terminal Restoration**:
+- [x] **Terminal Restoration**:
   - Guarantee that the terminal cursor (`\ESC[?25h`), line-buffering, and echo modes are restored under all abrupt termination paths.
-- [ ] **Partial Summary Block**:
+- [x] **Partial Summary Block**:
   - Render an honest partial summary block (`bmOutcome = Just BuildCancelled`) upon receiving an abort signal, documenting the time and modules completed prior to interruption.
 
 ---
