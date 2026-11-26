@@ -29,6 +29,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
 import System.Directory (doesFileExist, getTemporaryDirectory)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>))
@@ -457,6 +458,111 @@ runGoldenReplayTests = do
         else putStrLn "  Golden Replay log tests: FAIL"
       pure goldenOk
 
+-- | Generator for ViewMode
+genViewMode :: Gen ViewMode
+genViewMode = elements [ViewGraph, ViewZen, ViewMosaic, ViewPlain, ViewLinear]
+
+-- | Generator for ErrorStyle
+genErrorStyle :: Gen ErrorStyle
+genErrorStyle = elements [ErrorClassic, ErrorFriendly]
+
+-- | Generator for BuildConfig
+genBuildConfig :: Gen BuildConfig
+genBuildConfig = BuildConfig
+  <$> oneof [pure Nothing, Just <$> genViewMode]
+  <*> oneof [pure Nothing, Just <$> genErrorStyle]
+  <*> arbitrary
+  <*> arbitrary
+  <*> oneof [pure Nothing, Just <$> elements ["rasika", "nord", "monochrome", "solarized"]]
+
+-- | Property 15: BuildConfig Semigroup associativity law.
+prop_configSemigroupAssociative :: Property
+prop_configSemigroupAssociative = forAll genBuildConfig $ \a ->
+  forAll genBuildConfig $ \b ->
+  forAll genBuildConfig $ \c ->
+    (a <> b) <> c == a <> (b <> c)
+
+-- | Property 16: BuildConfig Monoid identity laws.
+prop_configMonoidIdentity :: Property
+prop_configMonoidIdentity = forAll genBuildConfig $ \a ->
+  mempty <> a == a && a <> mempty == a
+
+-- | Property 17: Precedence enforcement CLI > Project > User > Defaults.
+prop_configPrecedenceLaw :: Property
+prop_configPrecedenceLaw = forAll genBuildConfig $ \cli ->
+  forAll genBuildConfig $ \proj ->
+  forAll genBuildConfig $ \user ->
+    let res = resolveBuildConfig cli proj user
+        expectedView = case cfgViewMode cli of
+          Just v  -> v
+          Nothing -> case cfgViewMode proj of
+            Just v  -> v
+            Nothing -> case cfgViewMode user of
+              Just v  -> v
+              Nothing -> resViewMode defaultBuildConfig
+        expectedErr = case cfgErrorStyle cli of
+          Just e  -> e
+          Nothing -> case cfgErrorStyle proj of
+            Just e  -> e
+            Nothing -> case cfgErrorStyle user of
+              Just e  -> e
+              Nothing -> resErrorStyle defaultBuildConfig
+        expectedKeep = case cfgKeepGoing cli of
+          Just k  -> k
+          Nothing -> case cfgKeepGoing proj of
+            Just k  -> k
+            Nothing -> case cfgKeepGoing user of
+              Just k  -> k
+              Nothing -> resKeepGoing defaultBuildConfig
+    in resViewMode res == expectedView && resErrorStyle res == expectedErr && resKeepGoing res == expectedKeep
+
+-- | Unit test verifying TOML parsing and file loading.
+runConfigTests :: IO Bool
+runConfigTests = do
+  putStrLn "Running configuration file resolution & TOML tests..."
+  let sampleToml = T.unlines
+        [ "# Project buildr config"
+        , "[build]"
+        , "view = \"zen\""
+        , "errors = \"friendly\""
+        , "keep-going = true"
+        , "explain-holes = true"
+        , "theme = \"rasika\""
+        ]
+  case parseTomlConfig sampleToml of
+    Left err -> do
+      putStrLn ("  TOML parse failed: " <> T.unpack err)
+      pure False
+    Right cfg -> do
+      let parseOk = cfgViewMode cfg == Just ViewZen
+                 && cfgErrorStyle cfg == Just ErrorFriendly
+                 && cfgKeepGoing cfg == Just True
+                 && cfgExplainHoles cfg == Just True
+                 && cfgThemeName cfg == Just "rasika"
+      let altToml = T.unlines
+            [ "view = 'plain'"
+            , "keep_going = false"
+            , "explain_holes = false"
+            ]
+      let altOk = case parseTomlConfig altToml of
+            Right c2 -> cfgViewMode c2 == Just ViewPlain
+                     && cfgKeepGoing c2 == Just False
+                     && cfgExplainHoles c2 == Just False
+            Left _ -> False
+      tmp <- getTemporaryDirectory
+      let testFile = tmp </> "test-buildr.toml"
+      TIO.writeFile testFile sampleToml
+      fileRes <- loadConfigFile testFile
+      let fileOk = case fileRes of
+            Right c3 -> c3 == cfg
+            Left _   -> False
+
+      let allOk = parseOk && altOk && fileOk
+      if allOk
+        then putStrLn "  Configuration tests: PASS"
+        else putStrLn "  Configuration tests: FAIL"
+      pure allOk
+
 main :: IO ()
 main = do
   putStrLn "=========================================================="
@@ -466,6 +572,7 @@ main = do
   planOk <- runPlanTests
   ipcOk <- runIpcTests
   goldenOk <- runGoldenReplayTests
+  cfgOk <- runConfigTests
 
   res1 <- quickCheckResult (withNumTests 100 prop_eventJsonRoundTrip)
   res2 <- quickCheckResult (withNumTests 200 prop_barWidthRespectsBounds)
@@ -481,11 +588,17 @@ main = do
   res12 <- quickCheckResult (withNumTests 50 prop_hinsightGateJsonRoundTrip)
   res13 <- quickCheckResult (withNumTests 50 prop_holeFitJsonRoundTrip)
   res14 <- quickCheckResult (withNumTests 100 prop_errorStyleHonestyPreserved)
+  res15 <- quickCheckResult (withNumTests 100 prop_configSemigroupAssociative)
+  res16 <- quickCheckResult (withNumTests 100 prop_configMonoidIdentity)
+  res17 <- quickCheckResult (withNumTests 100 prop_configPrecedenceLaw)
 
-  let allPassed = bOk && planOk && ipcOk && goldenOk && isSuccess res1 && isSuccess res2 && isSuccess res3
+  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk
+                      && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
-                      && isSuccess res7 && isSuccess res8 && isSuccess res9 && isSuccess res10 && isSuccess res11
-                      && isSuccess res12 && isSuccess res13 && isSuccess res14
+                      && isSuccess res7 && isSuccess res8 && isSuccess res9
+                      && isSuccess res10 && isSuccess res11 && isSuccess res12
+                      && isSuccess res13 && isSuccess res14 && isSuccess res15
+                      && isSuccess res16 && isSuccess res17
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

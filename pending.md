@@ -6,11 +6,11 @@ This document tracks pending implementation items, architectural enhancements, a
 
 ## 1. Configuration File Resolution (§18)
 
-- [ ] **Project & User Configuration**:
+- [x] **Project & User Configuration**:
   - Support `buildr.toml` in the project root directory.
   - Support `$XDG_CONFIG_HOME/buildr/config.toml` (or `~/.config/buildr/config.toml`) for user defaults.
   - Configuration keys should mirror CLI flags (`view`, `errors`, `keep-going`, `explain-holes`, `theme`).
-- [ ] **Precedence Order**:
+- [x] **Precedence Order**:
   - Enforce precedence: `CLI flags > Project configuration (buildr.toml) > User configuration (config.toml) > Built-in defaults`.
 
 ---

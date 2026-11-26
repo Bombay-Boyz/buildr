@@ -9,3 +9,6 @@ dist-newstyle/
 *.swp
 *~
 cabal.project.local*
+# Project documentation - local drafts
+buildr-vision-v1.0.docx
+pending.md

@@ -36,6 +36,7 @@ common warnings
 library
     import:           warnings
     exposed-modules:
+        Buildr.Config
         Buildr.Core
         Buildr.Error
         Buildr.Event

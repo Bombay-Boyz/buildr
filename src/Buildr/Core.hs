@@ -7,7 +7,8 @@
 -- Stability   : experimental
 module Buildr.Core
   ( -- * Core Re-exports
-    module Buildr.Error
+    module Buildr.Config
+  , module Buildr.Error
   , module Buildr.Event
   , module Buildr.Grammar
   , module Buildr.Graph
@@ -22,6 +23,7 @@ module Buildr.Core
   , buildrVersion
   ) where
 
+import Buildr.Config
 import Buildr.Error
 import Buildr.Event
 import Buildr.Grammar

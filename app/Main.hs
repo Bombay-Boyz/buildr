@@ -57,7 +57,7 @@ import System.Process
 
 -- | Top-level CLI commands defined in §18.
 data Command
-  = CmdBuild !BuildOpts
+  = CmdBuild !CliBuildOpts
   | CmdWatch !WatchOpts
   | CmdWhy !WhyOpts
   | CmdReplay !ReplayOpts
@@ -77,18 +77,29 @@ data BuildOpts = BuildOpts
   , boCabalArgs    :: ![String]
   } deriving (Eq, Show)
 
+data CliBuildOpts = CliBuildOpts
+  { cboViewMode     :: !(Maybe ViewMode)
+  , cboErrorStyle   :: !(Maybe ErrorStyle)
+  , cboKeepGoing    :: !(Maybe Bool)
+  , cboExplainHoles :: !(Maybe Bool)
+  , cboJsonSink     :: !(Maybe FilePath)
+  , cboRecordFile   :: !(Maybe FilePath)
+  , cboThemeName    :: !(Maybe String)
+  , cboTargets      :: ![String]
+  , cboCabalArgs    :: ![String]
+  } deriving (Eq, Show)
+
 newtype WatchOpts = WatchOpts [String]
 data WhyOpts = WhyOpts !String !(Maybe String)
 data ReplayOpts = ReplayOpts !FilePath !ViewMode
 newtype StatsOpts = StatsOpts (Maybe FilePath)
 newtype ThemeOpts = ThemeOpts [String]
 
--- | Command-line option parser for 'ViewMode'.
-viewModeParser :: Parser ViewMode
-viewModeParser = option (eitherReader parseView)
+-- | Command-line option parser for 'ViewMode' without built-in default.
+cliViewModeParser :: Parser ViewMode
+cliViewModeParser = option (eitherReader parseView)
   ( long "view"
  <> metavar "VIEW"
- <> value ViewGraph
  <> help "Rendering view: graph, zen, mosaic, plain, linear"
   )
   where
@@ -100,12 +111,15 @@ viewModeParser = option (eitherReader parseView)
       "linear" -> Right ViewLinear
       other    -> Left ("Unknown view: " <> other)
 
--- | Command-line option parser for diagnostic 'ErrorStyle' (§13, §18).
-errorStyleParser :: Parser ErrorStyle
-errorStyleParser = option (eitherReader parseStyle)
+-- | Command-line option parser for 'ViewMode' with default for replay.
+viewModeParser :: Parser ViewMode
+viewModeParser = cliViewModeParser <|> pure ViewGraph
+
+-- | Command-line option parser for diagnostic 'ErrorStyle' without default.
+cliErrorStyleParser :: Parser ErrorStyle
+cliErrorStyleParser = option (eitherReader parseStyle)
   ( long "errors"
  <> metavar "STYLE"
- <> value ErrorClassic
  <> help "Error diagnostic style: classic, friendly"
   )
   where
@@ -114,13 +128,27 @@ errorStyleParser = option (eitherReader parseStyle)
       "friendly" -> Right ErrorFriendly
       other      -> Left ("Unknown error style: " <> other)
 
+-- | CLI parser for keep-going flag (tri-state: Just True, Just False, or Nothing).
+cliKeepGoingParser :: Parser (Maybe Bool)
+cliKeepGoingParser =
+      flag' (Just True) (long "keep-going" <> help "Continue compiling unaffected modules on error")
+  <|> flag' (Just False) (long "no-keep-going" <> help "Stop compiling on first error")
+  <|> pure Nothing
+
+-- | CLI parser for explain-holes flag (tri-state: Just True, Just False, or Nothing).
+cliExplainHolesParser :: Parser (Maybe Bool)
+cliExplainHolesParser =
+      flag' (Just True) (long "explain-holes" <> help "Automatically parse and suggest typed-hole candidates")
+  <|> flag' (Just False) (long "no-explain-holes" <> help "Disable typed-hole suggestions")
+  <|> pure Nothing
+
 -- | CLI options parser for 'buildr build' (§18).
 buildOptsParser :: Parser Command
-buildOptsParser = CmdBuild <$> (BuildOpts
-  <$> viewModeParser
-  <*> errorStyleParser
-  <*> switch (long "keep-going" <> help "Continue compiling unaffected modules on error")
-  <*> switch (long "explain-holes" <> help "Automatically parse and suggest typed-hole candidates")
+buildOptsParser = CmdBuild <$> (CliBuildOpts
+  <$> optional cliViewModeParser
+  <*> optional cliErrorStyleParser
+  <*> cliKeepGoingParser
+  <*> cliExplainHolesParser
   <*> optional (strOption (long "json" <> metavar "FILE|-" <> help "Stream JSON events to file or stdout"))
   <*> optional (strOption (long "record" <> metavar "FILE.jsonl" <> help "Record Event Protocol v1 stream to log file"))
   <*> optional (strOption (long "theme" <> metavar "NAME" <> help "Terminal visual theme (e.g. rasika)"))
@@ -156,7 +184,32 @@ runCommand :: Command -> IO ()
 runCommand = \case
   CmdDoctor -> runDoctor
   CmdReplay (ReplayOpts filePath viewMode) -> runReplay filePath viewMode
-  CmdBuild opts -> runBuild opts
+  CmdBuild cliOpts -> do
+    let cliConfig = BuildConfig
+          { cfgViewMode     = cboViewMode cliOpts
+          , cfgErrorStyle   = cboErrorStyle cliOpts
+          , cfgKeepGoing    = cboKeepGoing cliOpts
+          , cfgExplainHoles = cboExplainHoles cliOpts
+          , cfgThemeName    = cboThemeName cliOpts
+          }
+    res <- resolveEffectiveConfig cliConfig
+    case res of
+      Left err -> do
+        TIO.putStrLn (describeConfigError err)
+        exitWith (ExitFailure 2)
+      Right resolved -> do
+        let opts = BuildOpts
+              { boViewMode     = resViewMode resolved
+              , boErrorStyle   = resErrorStyle resolved
+              , boKeepGoing    = resKeepGoing resolved
+              , boExplainHoles = resExplainHoles resolved
+              , boJsonSink     = cboJsonSink cliOpts
+              , boRecordFile   = cboRecordFile cliOpts
+              , boThemeName    = resThemeName resolved
+              , boTargets      = cboTargets cliOpts
+              , boCabalArgs    = cboCabalArgs cliOpts
+              }
+        runBuild opts
   CmdWatch (WatchOpts targets) -> runWatch targets
   CmdWhy (WhyOpts modName maybeUnit) -> runWhy modName maybeUnit
   CmdStats (StatsOpts maybeDir) -> runStats maybeDir

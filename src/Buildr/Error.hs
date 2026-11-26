@@ -81,6 +81,10 @@ data ConfigError
   -- ^ Raised when the detected cabal-install version falls outside supported bounds.
   | ConfigInvalidOption !Text
   -- ^ Raised when an unrecognised or mutually exclusive configuration option is provided.
+  | ConfigParseError !FilePath !Text
+  -- ^ Raised when parsing a configuration file fails at the given path.
+  | ConfigFileReadError !FilePath !Text
+  -- ^ Raised when reading a configuration file fails due to an I/O error.
   deriving (Eq, Show)
 
 -- | The canonical top-level error type partitioning failures by pipeline stage.
@@ -143,6 +147,10 @@ describeConfigError = \case
     "Unsupported cabal-install version " <> v <> ". buildr requires cabal-install 3.12 through 3.16."
   ConfigInvalidOption opt ->
     "Invalid configuration option: " <> opt
+  ConfigParseError path reason ->
+    "Failed to parse configuration file at " <> T.pack path <> ": " <> reason
+  ConfigFileReadError path reason ->
+    "Failed to read configuration file at " <> T.pack path <> ": " <> reason
 
 -- | | The top-level error describer dispatching to stage-specific describers.
 -- Guarantees complete, informative error output without stringly typing.
