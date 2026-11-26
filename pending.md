@@ -29,11 +29,11 @@ This document tracks pending implementation items, architectural enhancements, a
 
 ## 3. Dynamic Terminal Resizing & Advanced VT Sequences (§7, §19, §20)
 
-- [ ] **Dynamic Resizing on `SIGWINCH`**:
+- [x] **Dynamic Resizing on `SIGWINCH`**:
   - Capture window size change events dynamically during live rendering.
   - Recalculate terminal column width to adjust module row truncation and progress bar dimensions.
   - Dynamically collapse rendering into the **Zen view** if terminal height drops below 10 rows.
-- [ ] **Advanced VT Sequences (Detected when present)**:
+- [x] **Advanced VT Sequences (Detected when present)**:
   - **OSC 8 Hyperlinks**: Emit clickable `file://` hyperlinks for error source spans and `https://errors.haskell.org` documentation links.
   - **SGR 4:3 Undercurl & SGR 58**: Emit wavy underlines for compiler diagnostics when terminal emulator capabilities indicate support.
   - **OSC 9;4 Progress**: Stream taskbar and window tab progress state to modern terminal emulators (e.g. Ghostty, iTerm2, WezTerm, Windows Terminal).

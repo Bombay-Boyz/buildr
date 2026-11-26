@@ -13,6 +13,7 @@ module Buildr.Signal
     forwardSignalToProcessGroup
   , forwardAbortSignals
   , withProcessGroupSignals
+  , withWindowResizeHandler
     -- * Terminal State Restoration
   , setupTerminal
   , restoreTerminal
@@ -47,6 +48,7 @@ import System.Posix.Signals
   , sigTERM
   , signalProcessGroup
   )
+import System.Posix.Signals.Exts (sigWINCH)
 import System.Process (ProcessHandle, getPid)
 
 -- | Forwards a POSIX signal directly to the child process's process group.
@@ -89,6 +91,13 @@ withProcessGroupSignals ph onAbort action = do
   bracket (installSig sigINT) (\old -> restoreSig sigINT old) $ \_ ->
     bracket (installSig sigTERM) (\old -> restoreSig sigTERM old) $ \_ ->
       action
+
+-- | Installs a SIGWINCH listener that triggers an action whenever the terminal window is resized.
+withWindowResizeHandler :: IO () -> IO a -> IO a
+withWindowResizeHandler onResize action = do
+  let installWinch = installHandler sigWINCH (Catch onResize) Nothing
+      restoreWinch old = installHandler sigWINCH old Nothing
+  bracket installWinch restoreWinch (const action)
 
 -- | Configures terminal settings: hides cursor and disables echo/buffering when attached to a TTY.
 setupTerminal :: Bool -> IO ()

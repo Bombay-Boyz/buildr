@@ -333,17 +333,22 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
               exitFailure
             Right serverHandle -> do
               isTty <- hIsTerminalDevice stdin
-              tuiVar <- newMVar (TuiState viewMode True 0 False)
+              initDims <- getTerminalDimensions
+              caps <- detectTerminalCaps
+              tuiVar <- newMVar (TuiState viewMode True 0 False initDims)
 
               -- Guarantee terminal restoration under all exit paths (§20)
-              withTerminalRestored (isTty && viewMode /= ViewPlain) $ do
-                -- 3. Run live display loop in background
-                bracket (forkIO (liveRenderLoop modelVar tuiVar)) killThread $ \_renderThread -> do
-                  -- 3b. Interactive keyboard input loop if attached to a terminal (§12.6, §14, §15)
-                  bracket (if isTty && viewMode /= ViewPlain
-                             then Just <$> forkIO (interactiveInputLoop tuiVar modelVar)
-                             else pure Nothing)
-                          (\mIn -> case mIn of Just inTid -> killThread inTid; Nothing -> pure ()) $ \_ -> do
+              withTerminalRestored (isTty && viewMode /= ViewPlain) $
+                withWindowResizeHandler (do
+                  d <- getTerminalDimensions
+                  modifyMVar_ tuiVar (\s -> pure s { tsDimensions = d })) $
+                  -- 3. Run live display loop in background
+                  bracket (forkIO (liveRenderLoop caps modelVar tuiVar)) killThread $ \_renderThread ->
+                    -- 3b. Interactive keyboard input loop if attached to a terminal (§12.6, §14, §15)
+                    bracket (if isTty && viewMode /= ViewPlain
+                               then Just <$> forkIO (interactiveInputLoop tuiVar modelVar)
+                               else pure Nothing)
+                            (\mIn -> case mIn of Just inTid -> killThread inTid; Nothing -> pure ()) $ \_ -> do
 
                     -- 4. Invoke cabal build passing wrapper and BUILDR_SOCKET
                     curEnv <- getEnvironment
@@ -364,6 +369,7 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
                           nowNs <- getMonotonicTimeNSec
                           let totalWallNs = fromIntegral (nowNs - startNs) :: Int64
                           m <- readMVar modelVar
+                          TIO.putStr (formatOsc9Progress caps TaskbarClear 0)
                           TIO.putStr (formatCancellationSummary m totalWallNs)
                           hFlush stdout
                           forwardAbortSignals ph
@@ -384,6 +390,7 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
                         _ <- saveHistoryCache histPath finalCache
 
                         let totalWallNs = fromIntegral (endNs - startNs) :: Int64
+                        TIO.putStr (formatOsc9Progress caps TaskbarClear 0)
                         unless (viewMode == ViewZen) $ do
                           TIO.putStr (renderSummaryBlock finalModel totalWallNs)
                         exitWith code
@@ -400,6 +407,7 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
                         _ <- saveHistoryCache histPath finalCache
 
                         let totalWallNs = fromIntegral (endNs - startNs) :: Int64
+                        TIO.putStr (formatOsc9Progress caps TaskbarClear 0)
                         unless (viewMode == ViewZen) $ do
                           TIO.putStr (renderSummaryBlock finalModel totalWallNs)
                         exitWith code
@@ -485,6 +493,7 @@ data TuiState = TuiState
   , tsShowWarnings :: !Bool
   , tsSelectedRow  :: !Int
   , tsDetached     :: !Bool
+  , tsDimensions   :: !TerminalDimensions
   } deriving (Eq, Show)
 
 -- | Keyboard event parsed from raw terminal input.
@@ -587,16 +596,31 @@ interactiveInputLoop tuiVar modelVar = forever $ do
         [] -> pure ()
     _ -> pure ()
 
--- | Periodically refreshes terminal display with latest model state.
-liveRenderLoop :: MVar BuildModel -> MVar TuiState -> IO ()
-liveRenderLoop modelVar tuiVar = forever $ do
+-- | Periodically refreshes terminal display with latest model state and dynamic dimensions (§7, §19, §20).
+liveRenderLoop :: TerminalCaps -> MVar BuildModel -> MVar TuiState -> IO ()
+liveRenderLoop caps modelVar tuiVar = forever $ do
   threadDelay 150000 -- ~6.6 fps refresh rate
+  dims <- getTerminalDimensions
+  modifyMVar_ tuiVar (\s -> pure s { tsDimensions = dims })
   tState <- readMVar tuiVar
   unless (tsDetached tState) $ do
     m <- readMVar modelVar
+    let effMode = effectiveViewMode (tsViewMode tState) dims
+        mSel = if effMode == ViewGraph then Just (tsSelectedRow tState) else Nothing
+        frame = renderViewWithDims dims effMode mSel m
+
+        -- Stream OSC 9;4 progress to modern terminal taskbar / tab (§7)
+        counts = countModulesByStatus m
+        doneCount = Map.findWithDefault 0 "done" counts
+        failedCount = Map.findWithDefault 0 "failed" counts
+        totalMods = sum (Map.elems counts)
+        pct = if totalMods > 0 then (doneCount * 100) `div` totalMods else 0
+        taskbarSt = if failedCount > 0 then TaskbarError else TaskbarNormal
+        osc9 = formatOsc9Progress caps taskbarSt pct
+
     putStr "\r\ESC[K"
-    let mSel = if tsViewMode tState == ViewGraph then Just (tsSelectedRow tState) else Nothing
-    TIO.putStr (renderViewSelected (tsViewMode tState) mSel m)
+    unless (T.null osc9) (TIO.putStr osc9)
+    TIO.putStr frame
     hFlush stdout
 
 -- | Watch mode rebuilding targets on change (§18).

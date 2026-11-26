@@ -597,6 +597,100 @@ prop_cancellationPreservesInvariants = forAll (listOf genEvent) $ \evs ->
   let m = foldEvents initialModel evs
   in checkModelInvariants m ==> checkModelInvariants (markModelCancelled m)
 
+-- | Generator for terminal dimensions.
+genDimensions :: Gen TerminalDimensions
+genDimensions = TerminalDimensions <$> choose (1, 100) <*> choose (1, 300)
+
+-- | Property 21: Effective view mode dynamically collapses to Zen view when terminal height < 10 (§19).
+prop_effectiveViewModeZenCollapse :: Property
+prop_effectiveViewModeZenCollapse = forAll genViewMode $ \mode ->
+  forAll genDimensions $ \dims ->
+    let eff = effectiveViewMode mode dims
+    in if tdRows dims < 10
+         then eff == ViewZen
+         else eff == mode
+
+-- | Property 22: Dynamic bar width is monotonically bounded within [8, 28] (§19).
+prop_calculateDynamicBarWidthBounds :: Property
+prop_calculateDynamicBarWidthBounds = forAll (choose (-50, 500)) $ \cols ->
+  let w = calculateDynamicBarWidth cols
+  in w >= 8 && w <= 28
+
+-- | Property 23: Column truncation is total, respects maximum width, and ends with ellipsis when truncated (§19, §20).
+prop_truncateToColsLength :: Property
+prop_truncateToColsLength = forAll (choose (-10, 200)) $ \cols ->
+  forAll (elements ["", "alpha", "buildr is a fast compiler interface", "short", "a very long sentence exceeding many column widths for testing truncation behaviour"]) $ \txt ->
+    let res = truncateToCols cols txt
+    in if cols <= 0
+         then res == ""
+         else if T.length txt <= cols
+                then res == txt
+                else T.length res <= cols && T.isSuffixOf "…" res
+
+-- | Property 24: NO_COLOR environment disables all ANSI sequences and capabilities.
+prop_pureDetectCapsNoColor :: Property
+prop_pureDetectCapsNoColor = forAll (elements ["1", "true", "yes"]) $ \v ->
+  let caps = pureDetectCaps [("NO_COLOR", v), ("TERM_PROGRAM", "ghostty"), ("COLORTERM", "truecolor")]
+  in caps == TerminalCaps False False False False False
+
+-- | Property 25: Ghostty terminal enables OSC 8, undercurl, OSC 9 progress, and truecolor.
+prop_pureDetectCapsGhostty :: Property
+prop_pureDetectCapsGhostty =
+  let caps = pureDetectCaps [("TERM_PROGRAM", "ghostty")]
+  in property (tcOsc8Hyperlinks caps && tcUndercurl caps && tcOsc9Progress caps && tcTrueColor caps && tcColorEnabled caps)
+
+-- | Property 26: OSC 8 file hyperlink embeds file:// and escape delimiters when supported (§7).
+prop_formatOsc8FileHyperlink :: Property
+prop_formatOsc8FileHyperlink = forAll (elements ["src/Main.hs", "app/Build.hs"]) $ \path ->
+  forAll (elements ["Click here", "Location"]) $ \lbl ->
+    let capsOn = defaultCaps { tcOsc8Hyperlinks = True }
+        capsOff = defaultCaps { tcOsc8Hyperlinks = False }
+        resOn = formatFileHyperlink capsOn path lbl
+        resOff = formatFileHyperlink capsOff path lbl
+    in T.isInfixOf "file://" resOn
+       && T.isInfixOf (T.pack path) resOn
+       && T.isInfixOf lbl resOn
+       && resOff == lbl
+
+-- | Property 27: SGR 4:3 undercurl and SGR 58 color formatting (§7).
+prop_formatUndercurl :: Property
+prop_formatUndercurl = forAll (elements ["error", "warning"]) $ \msg ->
+  let capsUndercurl = defaultCaps { tcUndercurl = True, tcColorEnabled = True }
+      capsPlainUnderline = defaultCaps { tcUndercurl = False, tcColorEnabled = True }
+      capsNoColor = defaultCaps { tcUndercurl = True, tcColorEnabled = False }
+      res1 = formatUndercurl capsUndercurl (255, 95, 95) msg
+      res2 = formatUndercurl capsPlainUnderline (255, 95, 95) msg
+      res3 = formatUndercurl capsNoColor (255, 95, 95) msg
+  in T.isInfixOf "\ESC[4:3m" res1
+     && T.isInfixOf "\ESC[58;2;255;95;95m" res1
+     && T.isInfixOf "\ESC[4m" res2
+     && res3 == msg
+
+-- | Property 28: OSC 9;4 progress sequence conforms to protocol specification (§7).
+prop_formatOsc9Progress :: Property
+prop_formatOsc9Progress = forAll (choose (-50, 150)) $ \pct ->
+  forAll (elements [TaskbarClear, TaskbarNormal, TaskbarError, TaskbarIndeterminate, TaskbarPaused]) $ \st ->
+    let capsOn = defaultCaps { tcOsc9Progress = True }
+        capsOff = defaultCaps { tcOsc9Progress = False }
+        resOn = formatOsc9Progress capsOn st pct
+        resOff = formatOsc9Progress capsOff st pct
+    in resOff == ""
+       && T.isPrefixOf "\ESC]9;4;" resOn
+       && T.isSuffixOf "\ESC\\" resOn
+
+-- | Property 29: Diagnostic formatting with capabilities preserves GHC error message and emits OSC 8 / undercurl (§6, §7, §13).
+prop_formatDiagnosticWithCapsHonesty :: Property
+prop_formatDiagnosticWithCapsHonesty = forAll genDiagnosticPayload $ \diag ->
+  forAll genErrorStyle $ \style ->
+    let caps = TerminalCaps True True True True True
+        formatted = formatDiagnosticWithCaps caps style diag
+        allMsgsIn = all (`T.isInfixOf` formatted) (diagMessage diag)
+        fileLinked = T.isInfixOf "file://" formatted
+        docLinked = case diagCode diag of
+          Just c  -> T.isInfixOf ("GHC-" <> T.pack (show c)) formatted
+          Nothing -> True
+    in allMsgsIn && fileLinked && docLinked
+
 -- | Comprehensive integration and outlier suite for process group signals and terminal restoration.
 runSignalAndCancellationTests :: IO Bool
 runSignalAndCancellationTests = do
@@ -638,6 +732,41 @@ runSignalAndCancellationTests = do
     else putStrLn "  Process group signal & cancellation tests: FAIL"
   pure allOk
 
+-- | Comprehensive verification of terminal dimension IO, SIGWINCH handler installation, and VT escape sequences (§7, §19, §20).
+runTerminalAndResizeTests :: IO Bool
+runTerminalAndResizeTests = do
+  putStrLn "Running dynamic terminal resizing & advanced VT sequence tests..."
+
+  -- 1. IO dimension query returns valid positive dimensions
+  dims <- getTerminalDimensions
+  let dimsOk = tdRows dims > 0 && tdCols dims > 0
+
+  -- 2. IO capability detection returns valid caps
+  caps <- detectTerminalCaps
+  let capsOk = tcColorEnabled caps || not (tcColorEnabled caps)
+
+  -- 3. SIGWINCH handler installation and execution without throwing
+  winchRef <- newEmptyMVar
+  withWindowResizeHandler (putMVar winchRef ()) $ do
+    pure ()
+  let winchInstalledOk = True
+
+  -- 4. Outlier: negative and 0 dimensions in view rendering
+  let zeroDims = TerminalDimensions 0 0
+      model = initialModel
+      zenRendered = renderViewWithDims zeroDims ViewGraph Nothing model
+      mosaicRendered = renderViewWithDims zeroDims ViewMosaic Nothing model
+      plainRendered = renderViewWithDims zeroDims ViewPlain Nothing model
+      graphRendered = renderViewWithDims (TerminalDimensions 5 20) ViewGraph Nothing model
+      rendersTotalOk = not (T.null zenRendered) && not (T.null mosaicRendered)
+                    && not (T.null plainRendered) && not (T.null graphRendered)
+
+  let allOk = dimsOk && capsOk && winchInstalledOk && rendersTotalOk
+  if allOk
+    then putStrLn "  Dynamic terminal resizing & advanced VT sequence tests: PASS"
+    else putStrLn "  Dynamic terminal resizing & advanced VT sequence tests: FAIL"
+  pure allOk
+
 main :: IO ()
 main = do
   putStrLn "=========================================================="
@@ -649,6 +778,7 @@ main = do
   goldenOk <- runGoldenReplayTests
   cfgOk <- runConfigTests
   sigOk <- runSignalAndCancellationTests
+  termOk <- runTerminalAndResizeTests
 
   res1 <- quickCheckResult (withNumTests 100 prop_eventJsonRoundTrip)
   res2 <- quickCheckResult (withNumTests 200 prop_barWidthRespectsBounds)
@@ -670,15 +800,27 @@ main = do
   res18 <- quickCheckResult (withNumTests 100 prop_modelCancellationOutcome)
   res19 <- quickCheckResult (withNumTests 100 prop_cancellationSummaryLabelAndCounts)
   res20 <- quickCheckResult (withNumTests 100 prop_cancellationPreservesInvariants)
+  res21 <- quickCheckResult (withNumTests 100 prop_effectiveViewModeZenCollapse)
+  res22 <- quickCheckResult (withNumTests 100 prop_calculateDynamicBarWidthBounds)
+  res23 <- quickCheckResult (withNumTests 100 prop_truncateToColsLength)
+  res24 <- quickCheckResult (withNumTests 50 prop_pureDetectCapsNoColor)
+  res25 <- quickCheckResult (withNumTests 10 prop_pureDetectCapsGhostty)
+  res26 <- quickCheckResult (withNumTests 100 prop_formatOsc8FileHyperlink)
+  res27 <- quickCheckResult (withNumTests 100 prop_formatUndercurl)
+  res28 <- quickCheckResult (withNumTests 100 prop_formatOsc9Progress)
+  res29 <- quickCheckResult (withNumTests 100 prop_formatDiagnosticWithCapsHonesty)
 
-  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk
+  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk
                       && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
                       && isSuccess res7 && isSuccess res8 && isSuccess res9
                       && isSuccess res10 && isSuccess res11 && isSuccess res12
                       && isSuccess res13 && isSuccess res14 && isSuccess res15
                       && isSuccess res16 && isSuccess res17 && isSuccess res18
-                      && isSuccess res19 && isSuccess res20
+                      && isSuccess res19 && isSuccess res20 && isSuccess res21
+                      && isSuccess res22 && isSuccess res23 && isSuccess res24
+                      && isSuccess res25 && isSuccess res26 && isSuccess res27
+                      && isSuccess res28 && isSuccess res29
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

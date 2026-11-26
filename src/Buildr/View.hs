@@ -14,11 +14,18 @@ module Buildr.View
     -- * View Dispatcher
   , renderView
   , renderViewSelected
+  , renderViewWithDims
     -- * Specific Renderers
   , renderGraphView
   , renderGraphViewSelected
+  , renderGraphViewWithDims
+  , renderUnitSummary
+  , renderUnitSummaryWithWidth
+  , renderOverallBar
+  , renderOverallBarWithWidth
   , renderZenView
   , renderMosaicView
+  , renderMosaicViewWithDims
   , renderPlainView
   , renderPlainViewCi
   , renderLinearView
@@ -32,6 +39,13 @@ module Buildr.View
 import Buildr.Event (BuildOutcome (..), formatDiagnostic)
 import Buildr.Grammar
 import Buildr.Model
+import Buildr.Terminal
+  ( TerminalDimensions (..)
+  , calculateDynamicBarWidth
+  , defaultDimensions
+  , effectiveViewMode
+  , truncateToCols
+  )
 import Data.Int (Int64)
 import Data.List (maximumBy, partition)
 import qualified Data.Map.Strict as Map
@@ -39,31 +53,33 @@ import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 
--- | Closed sum of user-selectable viewing modes.
-data ViewMode
-  = ViewGraph
-  | ViewZen
-  | ViewMosaic
-  | ViewPlain
-  | ViewLinear
-  deriving (Eq, Show)
-
 -- | Top-level view rendering function dispatching purely by mode.
 renderView :: ViewMode -> BuildModel -> Text
 renderView mode = renderViewSelected mode Nothing
 
 -- | Formats view with an optional selected row index for keyboard navigation (§12.6).
 renderViewSelected :: ViewMode -> Maybe Int -> BuildModel -> Text
-renderViewSelected mode mSel model = case mode of
-  ViewGraph  -> renderGraphViewSelected mSel model
-  ViewZen    -> renderZenView model
-  ViewMosaic -> renderMosaicView model
-  ViewPlain  -> renderPlainView model
-  ViewLinear -> renderLinearView model
+renderViewSelected = renderViewWithDims defaultDimensions
+
+-- | Formats view with dynamic terminal dimensions (§7, §19, §20):
+-- Dynamically collapses to Zen view if terminal height drops below 10 rows.
+-- Recalculates progress bar widths and truncates module rows to terminal columns.
+renderViewWithDims :: TerminalDimensions -> ViewMode -> Maybe Int -> BuildModel -> Text
+renderViewWithDims dims mode mSel model =
+  case effectiveViewMode mode dims of
+    ViewZen    -> renderZenView model
+    ViewGraph  -> renderGraphViewWithDims dims mSel model
+    ViewMosaic -> renderMosaicViewWithDims dims model
+    ViewPlain  -> renderPlainView model
+    ViewLinear -> renderLinearView model
 
 -- | Formats the default Graph Frontier view with optional keyboard selection cursor (§12.1, §12.6).
 renderGraphViewSelected :: Maybe Int -> BuildModel -> Text
-renderGraphViewSelected mSel model =
+renderGraphViewSelected = renderGraphViewWithDims defaultDimensions
+
+-- | Formats the Graph Frontier view with dynamic column width scaling and truncation (§19, §20).
+renderGraphViewWithDims :: TerminalDimensions -> Maybe Int -> BuildModel -> Text
+renderGraphViewWithDims dims mSel model =
   let units = Map.elems (bmUnits model)
       totalUnits = length units
       isActive u = case uiStatus u of
@@ -73,24 +89,26 @@ renderGraphViewSelected mSel model =
       (activeLines, _) = foldl renderUnitWithCursor ([], 0) activeUnits
       foldedLine = if null inactiveUnits
                      then []
-                     else ["  ▸ " <> T.pack (show (length inactiveUnits)) <> " dependencies planned/waiting"]
-      footer = "Overall: " <> renderOverallBar model
+                     else [truncateToCols cols ("  ▸ " <> T.pack (show (length inactiveUnits)) <> " dependencies planned/waiting")]
+      footer = truncateToCols cols ("Overall: " <> renderOverallBarWithWidth dynBarWidth model)
       helpLine = case mSel of
-        Just idx -> ["  [Keys: ↑/↓ select (row " <> T.pack (show idx) <> ") | g/m/z view | t warnings | x explain | 1-9 fits | e edit | q detach]"]
-        Nothing  -> ["  [Keys: g/m/z view | t warnings | x explain | 1-9 fits | ↑/↓ select | q detach]"]
+        Just idx -> [truncateToCols cols ("  [Keys: ↑/↓ select (row " <> T.pack (show idx) <> ") | g/m/z view | t warnings | x explain | 1-9 fits | e edit | q detach]")]
+        Nothing  -> [truncateToCols cols "  [Keys: g/m/z view | t warnings | x explain | 1-9 fits | ↑/↓ select | q detach]"]
+      header = truncateToCols cols ("=== buildr: Graph Frontier (Units: " <> T.pack (show totalUnits)
+                                   <> " | Slots: " <> T.pack (show (bmBusySlots model)) <> "/"
+                                   <> T.pack (show (bmTotalSlots model)) <> ") ===")
   in T.unlines
-       ( [ "=== buildr: Graph Frontier (Units: " <> T.pack (show totalUnits)
-             <> " | Slots: " <> T.pack (show (bmBusySlots model)) <> "/"
-             <> T.pack (show (bmTotalSlots model)) <> ") ==="
-         ]
-       <> (if null activeLines then map renderUnitSummary (take 10 units) else activeLines)
+       ( [header]
+       <> (if null activeLines then map (renderUnitSummaryWithWidth dynBarWidth cols) (take 10 units) else activeLines)
        <> foldedLine
        <> [footer]
        <> helpLine
        )
   where
+    cols = tdCols dims
+    dynBarWidth = calculateDynamicBarWidth cols
     renderUnitWithCursor (accLines, curIdx) u =
-      let uHeader = renderUnitSummary u
+      let uHeader = renderUnitSummaryWithWidth dynBarWidth cols u
           mods = Map.elems (uiModules u)
           renderMod (mAcc, rIdx) m =
             let vState = statusToVisual (miStatus m)
@@ -99,7 +117,7 @@ renderGraphViewSelected mSel model =
                   ModDone _ _ -> 1.0
                   ModCompiling _ -> 0.5
                   _ -> 0.0
-                modBar = renderBar 12 modRatio
+                modBar = renderBar (max 6 (dynBarWidth `div` 2)) modRatio
                 infoStr = case miStatus m of
                   ModDone ms alloc -> formatDurationMs ms <> " (" <> formatBytes alloc <> ")"
                   ModCompiling _ ->
@@ -110,7 +128,8 @@ renderGraphViewSelected mSel model =
                   ModBlocked blk -> "blocked by " <> blk
                   _ -> stateName vState
                 cursor = if mSel == Just rIdx then "▶ " else "  "
-                rowText = cursor <> "  " <> T.singleton glyph <> " " <> miName m <> " " <> modBar <> " " <> infoStr
+                rowRaw = cursor <> "  " <> T.singleton glyph <> " " <> miName m <> " " <> modBar <> " " <> infoStr
+                rowText = truncateToCols cols rowRaw
             in (rowText : mAcc, rIdx + 1)
           (modRowsRev, nextIdx) = foldl renderMod ([], curIdx) (take 10 mods)
       in (accLines <> [uHeader] <> reverse modRowsRev, nextIdx)
@@ -119,21 +138,35 @@ renderGraphViewSelected mSel model =
 renderGraphView :: BuildModel -> Text
 renderGraphView = renderGraphViewSelected Nothing
 
--- | Renders a concise summary for a single unit within the graph view.
-renderUnitSummary :: UnitInfo -> Text
-renderUnitSummary u =
+-- | Renders a concise summary for a single unit with dynamic width.
+renderUnitSummaryWithWidth :: Int -> Int -> UnitInfo -> Text
+renderUnitSummaryWithWidth barWidth cols u =
   let totalMods = Map.size (uiModules u)
       doneMods = length (filter isModuleDone (Map.elems (uiModules u)))
       ratio = if totalMods > 0 then fromIntegral doneMods / fromIntegral totalMods else 0.0
-      bar = renderBar defaultBarWidth ratio
+      bar = renderBar barWidth ratio
       statusLabel = case uiStatus u of
         UnitPlanned       -> "planned"
         UnitBuilding _    -> "building"
         UnitCompleted c   -> "completed (" <> T.pack (show c) <> ")"
         UnitFailed c _    -> "failed (" <> T.pack (show c) <> ")"
         UnitStopped       -> "stopped"
-  in "  " <> uiPackage u <> " " <> bar <> " "
-       <> T.pack (show doneMods) <> "/" <> T.pack (show totalMods) <> " [" <> statusLabel <> "]"
+      raw = "  " <> uiPackage u <> " " <> bar <> " "
+         <> T.pack (show doneMods) <> "/" <> T.pack (show totalMods) <> " [" <> statusLabel <> "]"
+  in truncateToCols cols raw
+
+-- | Renders a concise summary for a single unit within the graph view.
+renderUnitSummary :: UnitInfo -> Text
+renderUnitSummary = renderUnitSummaryWithWidth defaultBarWidth 80
+
+-- | Computes the overall progress bar with customized width.
+renderOverallBarWithWidth :: Int -> BuildModel -> Text
+renderOverallBarWithWidth barW model =
+  let allMods = concatMap (Map.elems . uiModules) (Map.elems (bmUnits model))
+      totalMods = length allMods
+      doneMods = length (filter isModuleDone allMods)
+      ratio = if totalMods > 0 then fromIntegral doneMods / fromIntegral totalMods else 0.0
+  in renderBar barW ratio <> " " <> T.pack (show doneMods) <> "/" <> T.pack (show totalMods)
 
 -- | Renders the single-line Zen view (§12.2).
 renderZenView :: BuildModel -> Text
@@ -149,9 +182,9 @@ renderZenView model =
                     else "compiling"
   in "buildr " <> bar <> " " <> T.pack (show doneCount) <> "/" <> T.pack (show totalMods) <> " · " <> statusStr
 
--- | Renders the Mosaic view (compact character cell per module, §12.3).
-renderMosaicView :: BuildModel -> Text
-renderMosaicView model =
+-- | Renders the Mosaic view adapted to dynamic terminal dimensions (§12.3, §19, §20).
+renderMosaicViewWithDims :: TerminalDimensions -> BuildModel -> Text
+renderMosaicViewWithDims dims model =
   let allMods = concatMap (Map.elems . uiModules) (Map.elems (bmUnits model))
       cellForMod m = case miStatus m of
         ModPending     -> '·'
@@ -162,7 +195,18 @@ renderMosaicView model =
         ModBlocked _   -> '⊘'
         ModNotReached  -> '◌'
       cells = map cellForMod allMods
-  in "buildr mosaic: [" <> T.pack cells <> "]"
+      chunkSize = max 10 (tdCols dims - 6)
+      chunkedLines = map T.pack (chunksOf chunkSize cells)
+  in if null chunkedLines
+       then "buildr mosaic: []"
+       else T.unlines ("buildr mosaic:" : map (\l -> "  [" <> l <> "]") chunkedLines)
+  where
+    chunksOf _ [] = []
+    chunksOf n xs = take n xs : chunksOf n (drop n xs)
+
+-- | Renders the Mosaic view with default terminal dimensions (§12.3).
+renderMosaicView :: BuildModel -> Text
+renderMosaicView = renderMosaicViewWithDims defaultDimensions
 
 -- | Renders the Plain / CI view suitable for non-interactive log files (§12.4).
 renderPlainView :: BuildModel -> Text

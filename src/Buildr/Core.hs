@@ -18,6 +18,7 @@ module Buildr.Core
   , module Buildr.Model
   , module Buildr.Plan
   , module Buildr.Signal
+  , module Buildr.Terminal
   , module Buildr.Theme
   , module Buildr.View
     -- * Versioning
@@ -35,6 +36,7 @@ import Buildr.Ipc
 import Buildr.Model
 import Buildr.Plan
 import Buildr.Signal
+import Buildr.Terminal
 import Buildr.Theme
 import Buildr.View
 import Data.Text (Text)

@@ -11,8 +11,10 @@
 --   * Exact 20-cell progress bars with unicode eighth-block fractional resolution.
 --   * Strict totality without partial indexing or runtime exceptions (Standard 1.1, 5.2).
 module Buildr.Grammar
-  ( -- * Visual States & Glyphs
-    VisualState (..)
+  ( -- * View Modes
+    ViewMode (..)
+    -- * Visual States & Glyphs
+  , VisualState (..)
   , stateGlyph
   , stateName
     -- * Progress Bar Specification
@@ -23,6 +25,15 @@ module Buildr.Grammar
 
 import Data.Text (Text)
 import qualified Data.Text as T
+
+-- | Closed sum of user-selectable viewing modes (§18).
+data ViewMode
+  = ViewGraph
+  | ViewZen
+  | ViewMosaic
+  | ViewPlain
+  | ViewLinear
+  deriving (Eq, Show)
 
 -- | Semantic visual states recognized in Visual Grammar v1.
 data VisualState
