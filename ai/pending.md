@@ -108,3 +108,9 @@ This document tracks implementation items, architectural enhancements, and bench
   - Added IPC transport abstraction detection (Windows Named Pipes vs Unix Domain Sockets).
   - Added terminal dimensions and color support reporting (24-bit TrueColor, ANSI 16/256, NO_COLOR).
   - Added VT sequence capability detection (OSC 8 Hyperlinks, OSC 9;4 Taskbar Progress, SGR 4:3 Undercurl).
+- [x] **Cabal Store Dependency Failure Log Tail (§16)**:
+  - Extended `parseCabalLifecycleLine` in `Buildr.Event` to extract log file paths from Cabal store compilation failures (`See <path> for details`).
+  - Added `bmStoreLogs` and `attachStoreLog` in `Buildr.Model` to track store failure log paths with bounded 20-line tails.
+  - Enhanced `renderSummaryBlock` in `Buildr.View` to automatically render the failed package name, log path, and trailing 20 lines.
+  - Integrated `attachFailedStoreLogs` into `Buildr.Cli` IO completion to inspect and read failed store dependency logs safely.
+  - Verified with QuickCheck Properties 45, 46, and 47.

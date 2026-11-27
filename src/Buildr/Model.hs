@@ -19,6 +19,7 @@ module Buildr.Model
   , initialModel
   , applyEvent
   , foldEvents
+  , attachStoreLog
     -- * Queries & Invariant Checks
   , countModulesByStatus
   , isModuleDone
@@ -82,6 +83,7 @@ data BuildModel = BuildModel
   , bmBusySlots    :: !Int
   , bmTotalSlots   :: !Int
   , bmDiagnostics  :: ![DiagnosticPayload]
+  , bmStoreLogs    :: !(Map Text (FilePath, [Text]))
   } deriving (Eq, Show)
 
 -- | Initializes an empty pure build model.
@@ -93,6 +95,7 @@ initialModel = BuildModel
   , bmBusySlots    = 0
   , bmTotalSlots   = 1
   , bmDiagnostics  = []
+  , bmStoreLogs    = Map.empty
   }
 
 -- | Updates a unit inside the model map safely by exact unit id or matching package name.
@@ -159,7 +162,12 @@ applyEvent model ev = case eventPayload ev of
 
   PayloadUnitFailed uid code logPath ->
     let m1 = updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitFailed code logPath }) model
-    in deriveBlockedAndNotReached uid m1
+        m2 = case logPath of
+               Just p  -> if Map.member uid (bmStoreLogs m1)
+                            then m1
+                            else m1 { bmStoreLogs = Map.insert uid (p, []) (bmStoreLogs m1) }
+               Nothing -> m1
+    in deriveBlockedAndNotReached uid m2
 
   PayloadUnitStopped uid ->
     let m1 = updateUnitByPkgOrId uid (\u -> u { uiStatus = UnitStopped }) model
@@ -247,6 +255,13 @@ deriveBlockedAndNotReached uid model =
 -- | Folds a list of events sequentially over the model using a strict fold.
 foldEvents :: BuildModel -> [Event] -> BuildModel
 foldEvents = foldl applyEvent
+
+-- | Attaches captured Cabal store dependency failure log lines to the model (§16).
+-- Guarantees the log lines are capped at the last 20 lines.
+attachStoreLog :: Text -> FilePath -> [Text] -> BuildModel -> BuildModel
+attachStoreLog uid path rawLines m =
+  let capped = reverse (take 20 (reverse rawLines))
+  in m { bmStoreLogs = Map.insert uid (path, capped) (bmStoreLogs m) }
 
 -- | Counts modules partitioned by status across all units.
 countModulesByStatus :: BuildModel -> Map Text Int

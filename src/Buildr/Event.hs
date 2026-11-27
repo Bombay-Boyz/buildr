@@ -436,11 +436,23 @@ parseCabalLifecycleLine rawLine =
          Just (PayloadUnitCompleted (cleanPkg pkg) 0)
        ("Completed" : pkg : _) ->
          Just (PayloadUnitCompleted (cleanPkg pkg) 0)
-       ("Failed" : pkg : _) ->
-         Just (PayloadUnitFailed (cleanPkg pkg) 1 Nothing)
+       ("Failed" : "to" : "build" : pkg : rest) ->
+         Just (PayloadUnitFailed (cleanPkg pkg) 1 (extractLogPath rest))
+       ("cabal:" : "Failed" : "to" : "build" : pkg : rest) ->
+         Just (PayloadUnitFailed (cleanPkg pkg) 1 (extractLogPath rest))
+       ("cabal:" : "Failed" : pkg : rest) ->
+         Just (PayloadUnitFailed (cleanPkg pkg) 1 (extractLogPath rest))
+       ("Failed" : pkg : rest) ->
+         Just (PayloadUnitFailed (cleanPkg pkg) 1 (extractLogPath rest))
        _ -> Nothing
   where
     cleanPkg p = T.dropWhileEnd (== '.') (T.takeWhile (/= '(') p)
+    extractLogPath tokens =
+      case dropWhile (/= "See") tokens of
+        ("See" : path : _) ->
+          let p = T.dropAround (`elem` ("'\"`.,()" :: String)) path
+          in if T.null p then Nothing else Just (T.unpack p)
+        _ -> Nothing
 
 -- | Intermediate representation for point coordinates in GHC JSON diagnostics.
 data RawGhcPoint = RawGhcPoint

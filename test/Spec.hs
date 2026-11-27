@@ -1063,6 +1063,38 @@ prop_summaryBlockFailedUnitsRebuildSuggestion = property $
       summaryText = renderSummaryBlock modelFailed 1000000
   in T.isInfixOf "Next steps: Run 'buildr build lib:my-app --keep-going'" summaryText
 
+-- | Property 45: Cabal lifecycle parsing captures store failure log paths (§16).
+prop_parseCabalLifecycleLineStoreFailureLog :: Property
+prop_parseCabalLifecycleLineStoreFailureLog = property $
+  let line1 = "Failed to build zlib-0.6.3.0 (which is required by ...). See /tmp/logs/zlib.log for details."
+      line2 = "cabal: Failed to build base-compat-0.13.1. See /home/user/.cabal/logs/base-compat.log for details."
+      p1 = parseCabalLifecycleLine line1
+      p2 = parseCabalLifecycleLine line2
+  in p1 == Just (PayloadUnitFailed "zlib-0.6.3.0" 1 (Just "/tmp/logs/zlib.log"))
+  && p2 == Just (PayloadUnitFailed "base-compat-0.13.1" 1 (Just "/home/user/.cabal/logs/base-compat.log"))
+
+-- | Property 46: Store failure log attachment guarantees maximum 20 trailing lines (§16).
+prop_attachStoreLogBoundsToTwentyLines :: Property
+prop_attachStoreLogBoundsToTwentyLines = property $
+  let raw50 = [ "log line " <> T.pack (show i) | i <- [1 .. 50 :: Int] ]
+      m = attachStoreLog "zlib" "/tmp/zlib.log" raw50 initialModel
+  in case Map.lookup "zlib" (bmStoreLogs m) of
+       Just (path, lines') ->
+         path == "/tmp/zlib.log"
+         && length lines' == 20
+         && lines' == [ "log line " <> T.pack (show i) | i <- [31 .. 50 :: Int] ]
+       Nothing -> False
+
+-- | Property 47: Summary block formats Cabal store failure log tail (§16).
+prop_summaryBlockRendersStoreLogTail :: Property
+prop_summaryBlockRendersStoreLogTail = property $
+  let tailLines = [ "error: zlib.h not found", "cabal failed to compile cbits" ]
+      m = attachStoreLog "zlib-0.6.3.0" "/path/to/zlib.log" tailLines initialModel
+      summaryText = renderSummaryBlock m 5000000000
+  in T.isInfixOf "--- Cabal Store Failure Log: zlib-0.6.3.0 (/path/to/zlib.log) [last 2 lines] ---" summaryText
+  && T.isInfixOf "error: zlib.h not found" summaryText
+  && T.isInfixOf "cabal failed to compile cbits" summaryText
+
 -- | Comprehensive verification of non-Haskell Event Protocol v1 producer integration (§23 Phase 3).
 runNonHaskellProducerTests :: IO Bool
 runNonHaskellProducerTests = do
@@ -1196,6 +1228,9 @@ main = do
   res42 <- quickCheckResult (withNumTests 100 prop_handleTuiKeySound)
   res43 <- quickCheckResult (withNumTests 100 prop_renderPlainViewCiEmitsAnnotations)
   res44 <- quickCheckResult (withNumTests 100 prop_summaryBlockFailedUnitsRebuildSuggestion)
+  res45 <- quickCheckResult (withNumTests 100 prop_parseCabalLifecycleLineStoreFailureLog)
+  res46 <- quickCheckResult (withNumTests 100 prop_attachStoreLogBoundsToTwentyLines)
+  res47 <- quickCheckResult (withNumTests 100 prop_summaryBlockRendersStoreLogTail)
 
   let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk && cabalCmdOk && winEditorOk && nonHaskellOk && benchOk
                       && isSuccess res1 && isSuccess res2 && isSuccess res3
@@ -1212,7 +1247,8 @@ main = do
                       && isSuccess res34 && isSuccess res35 && isSuccess res36
                       && isSuccess res37 && isSuccess res38 && isSuccess res39
                       && isSuccess res40 && isSuccess res41 && isSuccess res42
-                      && isSuccess res43 && isSuccess res44
+                      && isSuccess res43 && isSuccess res44 && isSuccess res45
+                      && isSuccess res46 && isSuccess res47
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

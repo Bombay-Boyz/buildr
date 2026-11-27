@@ -397,7 +397,20 @@ renderSummaryBlock model wallTimeNs =
                           then "Next steps: Run 'buildr build " <> T.intercalate " " (take 3 failedUnits) <> " --keep-going' to rebuild failed targets."
                           else "Next steps: Run 'buildr build --keep-going' or check compiler diagnostics above."
                    else "Build completed cleanly."
-  in T.unlines
+
+      storeLogSections =
+        let formatStoreLog (pkg, (path, logLines)) =
+              let hdr = "--- Cabal Store Failure Log: " <> pkg <> " (" <> T.pack path <> ") [last " <> T.pack (show (length logLines)) <> " lines] ---"
+                  body = if null logLines
+                           then "  See log file above for compilation failure details."
+                           else T.unlines logLines
+              in hdr <> "\n" <> body
+        in case Map.toList (bmStoreLogs model) of
+             []   -> []
+             logs -> [ "--------------------------------------------------------------------------------"
+                     , T.intercalate "\n" (map formatStoreLog logs)
+                     ]
+  in T.unlines (
        [ "================================================================================"
        , "=== buildr Outcome: " <> outcomeLabel <> " (Wall time: " <> formatDurationMs wallMs <> ") ==="
        , "================================================================================"
@@ -406,5 +419,7 @@ renderSummaryBlock model wallTimeNs =
        , slowestInfo
        , critPathLine
        , nextStep
-       , "================================================================================"
        ]
+       <> storeLogSections
+       <> [ "================================================================================" ]
+       )

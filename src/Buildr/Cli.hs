@@ -105,7 +105,10 @@ import Buildr.Ipc
   )
 import Buildr.Model
   ( BuildModel (..)
+  , UnitInfo (..)
+  , UnitStatus (..)
   , applyEvent
+  , attachStoreLog
   , countModulesByStatus
   , foldEvents
   , initialModel
@@ -156,8 +159,8 @@ import Control.Concurrent
   , threadDelay
   )
 import Control.Concurrent.Async (async, wait)
-import Control.Exception (IOException, bracket, catch)
-import Control.Monad (filterM, forever, unless, when)
+import Control.Exception (IOException, SomeException, bracket, catch, try)
+import Control.Monad (filterM, foldM, forever, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
 import Data.Char (isDigit)
@@ -798,7 +801,8 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
                         let totalWallNs = fromIntegral (endNs - startNs) :: Int64
                         TIO.putStr (formatOsc9Progress caps TaskbarClear 0)
                         unless (viewMode == ViewZen) $ do
-                          TIO.putStr (renderSummaryBlock finalModel totalWallNs)
+                          summaryModel <- attachFailedStoreLogs finalModel
+                          TIO.putStr (renderSummaryBlock summaryModel totalWallNs)
                         exitWith code
                       (_, Nothing, _, ph) -> do
                         let onAbort = renderCancellation ph
@@ -815,10 +819,37 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
                         let totalWallNs = fromIntegral (endNs - startNs) :: Int64
                         TIO.putStr (formatOsc9Progress caps TaskbarClear 0)
                         unless (viewMode == ViewZen) $ do
-                          TIO.putStr (renderSummaryBlock finalModel totalWallNs)
+                          summaryModel <- attachFailedStoreLogs finalModel
+                          TIO.putStr (renderSummaryBlock summaryModel totalWallNs)
                         exitWith code
   where
     cleanupServer _ = pure ()
+
+-- | Automatically inspects failed store units and attaches the last 20 lines of their log files (§16).
+attachFailedStoreLogs :: BuildModel -> IO BuildModel
+attachFailedStoreLogs model = do
+  let candidates =
+        [ (uiPackage u, path)
+        | u <- Map.elems (bmUnits model)
+        , case uiStatus u of
+            UnitFailed _ (Just _) -> True
+            _                     -> False
+        , Just path <- [case uiStatus u of UnitFailed _ mp -> mp; _ -> Nothing]
+        ] <> [ (pkg, p) | (pkg, (p, [])) <- Map.toList (bmStoreLogs model) ]
+      uniqueCandidates = Map.toList (Map.fromList candidates)
+  foldM (\m (pkg, path) -> do
+    exists <- doesFileExist path
+    if exists
+      then do
+        eTxt <- try (TIO.readFile path) :: IO (Either SomeException Text)
+        case eTxt of
+          Right txt ->
+            let allLines = T.lines txt
+                tail20 = reverse (take 20 (reverse allLines))
+            in pure (attachStoreLog pkg path tail20 m)
+          Left _ -> pure m
+      else pure m
+    ) model uniqueCandidates
 
 -- | Upfront discovery of module dependency graphs for local Cabal units (§8.2, §10, §14).
 discoverLocalUnitGraphs :: [PlanUnit] -> IO [Event]
