@@ -114,3 +114,7 @@ This document tracks implementation items, architectural enhancements, and bench
   - Enhanced `renderSummaryBlock` in `Buildr.View` to automatically render the failed package name, log path, and trailing 20 lines.
   - Integrated `attachFailedStoreLogs` into `Buildr.Cli` IO completion to inspect and read failed store dependency logs safely.
   - Verified with QuickCheck Properties 45, 46, and 47.
+- [x] **Estimate Quality & Median Absolute Error in `buildr stats` (§5 B6, §10.3, §18)**:
+  - Implemented pure `computeMedianAbsoluteError`, `computeMedianAbsolutePercentageError`, and `countHistoricalOverruns` in `Buildr.History`.
+  - Surfaced Median Absolute Error (MAE in ms), Median Absolute Percentage Error (MAPE %), Criterion B6 status, and historical overrun counts in `buildr stats`.
+  - Verified with QuickCheck Property 48.

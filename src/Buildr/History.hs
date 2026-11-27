@@ -21,6 +21,9 @@ module Buildr.History
   , emptyHistoryCache
   , insertTiming
   , computeUsualTime
+  , computeMedianAbsoluteError
+  , computeMedianAbsolutePercentageError
+  , countHistoricalOverruns
   , isOverrun
   , formatOverrun
   , getSlowestModules
@@ -127,6 +130,68 @@ getSlowestModules cache@(HistoryCache m) =
   let pairs = Map.toList m
       withMedian = [ (k, med) | (k, _) <- pairs, Just med <- [computeUsualTime k cache] ]
   in sortBy (comparing (Down . snd)) withMedian
+
+-- | Computes the overall Estimate Accuracy as the Median Absolute Error (MAE in milliseconds)
+-- across all historical module duration measurements (§5 B6, §10.3).
+-- Returns Nothing if no multi-run historical durations exist.
+computeMedianAbsoluteError :: HistoryCache -> Maybe Double
+computeMedianAbsoluteError (HistoryCache m) =
+  let allErrors = concatMap moduleErrors (Map.elems m)
+      moduleErrors entry =
+        let ds = mthDurationsMs entry
+        in case ds of
+             []  -> []
+             [_] -> []
+             _   ->
+               let sorted = sort ds
+                   mid = length sorted `div` 2
+               in case drop mid sorted of
+                    (med:_) -> [ fromIntegral (abs (d - med)) | d <- ds ]
+                    []      -> []
+  in case allErrors of
+       [] -> Nothing
+       errs ->
+         let sortedErrs = sort errs
+             mid = length sortedErrs `div` 2
+         in case drop mid sortedErrs of
+              (val:_) -> Just val
+              []      -> Nothing
+
+-- | Computes the Median Absolute Percentage Error (MAPE, 0.0% to 100+%) across all modules (§5 B6).
+computeMedianAbsolutePercentageError :: HistoryCache -> Maybe Double
+computeMedianAbsolutePercentageError (HistoryCache m) =
+  let allErrors = concatMap modulePctErrors (Map.elems m)
+      modulePctErrors entry =
+        let ds = mthDurationsMs entry
+        in case ds of
+             []  -> []
+             [_] -> []
+             _   ->
+               let sorted = sort ds
+                   mid = length sorted `div` 2
+               in case drop mid sorted of
+                    (med:_) ->
+                      let medD = max 1.0 (fromIntegral med :: Double)
+                      in [ (fromIntegral (abs (d - med)) / medD) * 100.0 | d <- ds ]
+                    []      -> []
+  in case allErrors of
+       [] -> Nothing
+       errs ->
+         let sortedErrs = sort errs
+             mid = length sortedErrs `div` 2
+         in case drop mid sortedErrs of
+              (val:_) -> Just val
+              []      -> Nothing
+
+-- | Counts the total number of historical module runs exceeding the 1.5x usual time overrun threshold (§10.3).
+countHistoricalOverruns :: HistoryCache -> Int
+countHistoricalOverruns cache@(HistoryCache m) =
+  length [ ()
+         | (k, entry) <- Map.toList m
+         , Just usual <- [computeUsualTime k cache]
+         , d <- mthDurationsMs entry
+         , isOverrun d usual
+         ]
 
 -- | Retrieves the heaviest modules by peak reported allocation in descending order.
 getHeaviestModules :: HistoryCache -> [(HistoryKey, Int64)]

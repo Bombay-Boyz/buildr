@@ -1095,6 +1095,30 @@ prop_summaryBlockRendersStoreLogTail = property $
   && T.isInfixOf "error: zlib.h not found" summaryText
   && T.isInfixOf "cabal failed to compile cbits" summaryText
 
+-- | Property 48: Estimate quality MAE/MAPE is non-negative and bounded (§5 B6, §10.3).
+prop_computeMedianAbsoluteErrorBounded :: Property
+prop_computeMedianAbsoluteErrorBounded = property $
+  let key1 = HistoryKey "/proj" "lib:test" "Module.A" "9.10.3" "3.16.1.0" "-O1"
+      key2 = HistoryKey "/proj" "lib:test" "Module.B" "9.10.3" "3.16.1.0" "-O1"
+      c1 = insertTiming key1 100 1000
+         $ insertTiming key1 105 1000
+         $ insertTiming key1 110 1000
+         $ insertTiming key1 95 1000
+         $ insertTiming key1 100 1000 emptyHistoryCache
+      c2 = insertTiming key2 300 1000
+         $ insertTiming key2 100 1000
+         $ insertTiming key2 100 1000
+         $ insertTiming key2 100 1000 c1
+      mae = computeMedianAbsoluteError c1
+      mape = computeMedianAbsolutePercentageError c1
+      overruns = countHistoricalOverruns c2
+  in case (mae, mape) of
+       (Just e, Just p) ->
+         e == 5.0
+         && abs (p - 5.0) < 0.001
+         && overruns == 1
+       _ -> False
+
 -- | Comprehensive verification of non-Haskell Event Protocol v1 producer integration (§23 Phase 3).
 runNonHaskellProducerTests :: IO Bool
 runNonHaskellProducerTests = do
@@ -1231,6 +1255,7 @@ main = do
   res45 <- quickCheckResult (withNumTests 100 prop_parseCabalLifecycleLineStoreFailureLog)
   res46 <- quickCheckResult (withNumTests 100 prop_attachStoreLogBoundsToTwentyLines)
   res47 <- quickCheckResult (withNumTests 100 prop_summaryBlockRendersStoreLogTail)
+  res48 <- quickCheckResult (withNumTests 100 prop_computeMedianAbsoluteErrorBounded)
 
   let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk && cabalCmdOk && winEditorOk && nonHaskellOk && benchOk
                       && isSuccess res1 && isSuccess res2 && isSuccess res3
@@ -1248,7 +1273,7 @@ main = do
                       && isSuccess res37 && isSuccess res38 && isSuccess res39
                       && isSuccess res40 && isSuccess res41 && isSuccess res42
                       && isSuccess res43 && isSuccess res44 && isSuccess res45
-                      && isSuccess res46 && isSuccess res47
+                      && isSuccess res46 && isSuccess res47 && isSuccess res48
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

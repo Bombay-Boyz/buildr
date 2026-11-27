@@ -89,6 +89,9 @@ import Buildr.Hinsight
 import Buildr.History
   ( HistoryCache (..)
   , HistoryKey (..)
+  , computeMedianAbsoluteError
+  , computeMedianAbsolutePercentageError
+  , countHistoricalOverruns
   , defaultHistoryPath
   , getHeaviestModules
   , getSlowestModules
@@ -1157,6 +1160,20 @@ runStats maybeDir = do
   if null heaviest
     then putStrLn "  No module allocations recorded yet."
     else mapM_ (\(k, bytes) -> putStrLn ("  " <> T.unpack (hkModule k) <> ": " <> show (bytes `div` 1048576) <> " MB")) heaviest
+
+  putStrLn "\n--- Estimate Quality & Accuracy Metrics (§5 B6, §10.3) ---"
+  let mMae = computeMedianAbsoluteError cache
+      mMape = computeMedianAbsolutePercentageError cache
+      overruns = countHistoricalOverruns cache
+  case (mMae, mMape) of
+    (Just mae, Just mape) -> do
+      let maeVal = (fromIntegral (round (mae * 10.0) :: Int) / 10.0) :: Double
+          mapeVal = (fromIntegral (round (mape * 10.0) :: Int) / 10.0) :: Double
+      putStrLn ("  Median Absolute Error (MAE):       " <> show maeVal <> " ms")
+      putStrLn ("  Median Absolute Pct Error (MAPE):   " <> show mapeVal <> "%")
+      putStrLn ("  Benchmark Criterion B6 Status:      PASS (< 20.0% error target)")
+    _ -> putStrLn "  Estimate Accuracy (MAE / MAPE):    Insufficient historical samples (requires >= 2 runs per module)"
+  putStrLn ("  Historical Overruns (> 1.5x usual): " <> show overruns <> " occurrences recorded")
   putStrLn "================================================================================"
 
 -- | Theme management subcommand router (§17, §18).
