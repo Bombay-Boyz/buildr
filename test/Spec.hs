@@ -20,6 +20,7 @@ module Main (main) where
 import Buildr.Core
 import Control.Concurrent (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket, throwIO, try)
+import Control.Monad (forM_)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
@@ -923,6 +924,186 @@ runCabalExternalCommandTests = do
   where
     isInfixOfStr sub str = T.isInfixOf (T.pack sub) (T.pack str)
 
+-- | Comprehensive execution of automated benchmark criteria (B1, B2, B4, B8) per §5 and §21.
+runBenchmarkSuite :: IO Bool
+runBenchmarkSuite = do
+  putStrLn "Running automated benchmark suite (§5, §21)..."
+  outcomes <- runAllBenchmarks
+  forM_ outcomes $ \bo -> do
+    let statusStr = if boPassed bo then "PASS" else "FAIL"
+    putStrLn ("  [" <> T.unpack (boCriterion bo) <> "] " <> T.unpack (boName bo) <> ": " <> statusStr)
+    putStrLn ("      Target:   " <> T.unpack (boTarget bo))
+    putStrLn ("      Measured: " <> T.unpack (boMeasured bo))
+    putStrLn ("      Details:  " <> T.unpack (boDetails bo))
+  let allPassed = all boPassed outcomes
+  if allPassed
+    then putStrLn "  Benchmark verification suite: PASS"
+    else putStrLn "  Benchmark verification suite: FAIL"
+  pure allPassed
+
+-- | Property 36: Percentile calculation is bounded by list minimum and maximum.
+prop_calculatePercentileBounded :: Positive Double -> [Positive Double] -> Property
+prop_calculatePercentileBounded (Positive pct) rawList = not (null rawList) ==>
+  let xs = map getPositive rawList
+      p = min 100.0 pct
+  in case calculatePercentile p xs of
+       Nothing  -> False
+       Just val -> val >= minimum xs && val <= maximum xs
+
+-- | Property 37: Pure build overhead percentage is non-negative and linear with overhead duration.
+prop_computeBuildOverheadLinear :: Positive Int64 -> Positive Int64 -> Property
+prop_computeBuildOverheadLinear (Positive o) (Positive b) =
+  let o' = o `div` 2  -- prevent arithmetic overflow when doubling
+      pct = computeBuildOverheadPct o' b
+  in property (pct >= 0.0 && computeBuildOverheadPct (o' * 2) b == pct * 2.0)
+
+-- | Property 38: Estimated CPU usage at 15 fps scales linearly with frame duration.
+prop_estimateCpuUsageLinear :: Positive Double -> Property
+prop_estimateCpuUsageLinear (Positive f) =
+  let u1 = estimateCpuUsageAt15Fps f
+      u2 = estimateCpuUsageAt15Fps (f * 2.0)
+  in property (u1 >= 0.0 && abs (u2 - u1 * 2.0) < 1e-6)
+
+-- | Generator for LspPosition.
+genLspPos :: Gen LspPosition
+genLspPos = LspPosition <$> choose (0, 1000) <*> choose (0, 120)
+
+-- | Generator for LspRange.
+genLspRange :: Gen LspRange
+genLspRange = LspRange <$> genLspPos <*> genLspPos
+
+-- | Generator for LspDiagnostic.
+genLspDiagnostic :: Gen LspDiagnostic
+genLspDiagnostic = do
+  rng <- genLspRange
+  sev <- elements [LspSeverityError, LspSeverityWarning, LspSeverityInformation, LspSeverityHint]
+  mCode <- oneof [pure Nothing, Just . LspCodeInt <$> choose (1000, 99999)]
+  src <- elements ["ghc", "buildr"]
+  msg <- elements ["Syntax error", "Type mismatch", "Unused identifier"]
+  hints <- listOf (elements ["Enable OverloadedStrings", "Add type signature"])
+  pure (LspDiagnostic rng sev mCode src msg hints)
+
+-- | Generator for EditorMessage.
+genEditorMessage :: Gen EditorMessage
+genEditorMessage = oneof
+  [ EditorPublishDiagnostics <$> (LspPublishDiagnosticsParams <$> elements ["file:///src/Main.hs", "file:///src/Core.hs"] <*> listOf genLspDiagnostic)
+  , EditorProgress <$> pure "buildr-build" <*> (LspProgressBegin <$> pure "Build started" <*> pure True <*> pure (Just 0))
+  , EditorProgress <$> pure "buildr-build" <*> (LspProgressReport <$> pure (Just 50) <*> pure (Just "Compiling unit"))
+  , EditorProgress <$> pure "buildr-build" <*> (LspProgressEnd <$> pure (Just "Done"))
+  , EditorBuildOutcome <$> elements [BuildSuccess, BuildFailed, BuildCancelled] <*> choose (0, 10000000000)
+  ]
+
+-- | Property 39: SourceSpan translation to LSP range is strictly 0-indexed and non-negative.
+prop_spanToLspRangeZeroIndexed :: Property
+prop_spanToLspRangeZeroIndexed = forAll genSpan $ \sp ->
+  let rng = spanToLspRange sp
+  in lpLine (lrStart rng) >= 0 && lpCharacter (lrStart rng) >= 0
+     && lpLine (lrEnd rng) >= 0 && lpCharacter (lrEnd rng) >= 0
+
+-- | Property 40: EditorMessage JSON Lines round-trip serialization.
+prop_editorMessageJsonRoundTrip :: Property
+prop_editorMessageJsonRoundTrip = forAll genEditorMessage $ \msg ->
+  decodeEditorMessageLine (encodeEditorMessageLine msg) == Just msg
+
+-- | Property 41: IPC transport detection correctly distinguishes Windows Named Pipes from Unix sockets.
+prop_detectIpcTransportSound :: Property
+prop_detectIpcTransportSound = property $
+  detectIpcTransport "\\\\.\\pipe\\buildr-session-123" == TransportWindowsNamedPipe
+  && detectIpcTransport "/tmp/buildr-session-123.sock" == TransportUnixSocket
+
+-- | Property 42: Interactive key transitions conform to Visual Grammar and user controls (§12.6).
+prop_handleTuiKeySound :: Property
+prop_handleTuiKeySound = property $
+  let s0 = defaultTuiState (TerminalDimensions 80 24) ViewGraph
+      sg = handleTuiKey (KeyChar 'g') s0
+      sm = handleTuiKey (KeyChar 'm') s0
+      sz = handleTuiKey (KeyChar 'z') s0
+      st = handleTuiKey (KeyChar 't') s0
+      sDown = handleTuiKey KeyDown s0
+      sUp = handleTuiKey KeyUp sDown
+      sUpBound = handleTuiKey KeyUp s0
+      sq = handleTuiKey (KeyChar 'q') s0
+  in tsViewMode sg == ViewGraph
+  && tsViewMode sm == ViewMosaic
+  && tsViewMode sz == ViewZen
+  && tsShowWarnings st == not (tsShowWarnings s0)
+  && tsSelectedRow sDown == 1
+  && tsSelectedRow sUp == 0
+  && tsSelectedRow sUpBound == 0
+  && tsDetached sq == True
+
+-- | Comprehensive verification of non-Haskell Event Protocol v1 producer integration (§23 Phase 3).
+runNonHaskellProducerTests :: IO Bool
+runNonHaskellProducerTests = do
+  putStrLn "Running non-Haskell compiler producer integration test (buildr-clang, §23 Phase 3)..."
+  let producerScript = "examples/clang-producer/buildr-clang"
+      sourceFile = "examples/clang-producer/main.c"
+  scriptExists <- doesFileExist producerScript
+  srcExists <- doesFileExist sourceFile
+  if not (scriptExists && srcExists)
+    then do
+      putStrLn "  Non-Haskell producer test skipped: source files not found"
+      pure False
+    else do
+      (code, out, _err) <- readProcessWithExitCode "python3" [producerScript, sourceFile] ""
+      let exitOk = code == ExitSuccess
+          rawLines = filter (not . BSC8.null) (BSC8.lines (BSC8.pack out))
+          decodedEvents = mapMaybe decodeEventLine rawLines
+          decodingOk = not (null decodedEvents) && length decodedEvents == length rawLines
+          
+          -- Fold the foreign events through the pure model state machine
+          foldedModel = foldEvents initialModel decodedEvents
+          outcomeOk = bmOutcome foldedModel == Just BuildSuccess
+          counts = countModulesByStatus foldedModel
+          countsOk = Map.findWithDefault 0 "done" counts >= 1
+          
+          -- Verify standard views render without error from non-Haskell event model
+          graphFrame = renderView ViewGraph foldedModel
+          zenFrame = renderView ViewZen foldedModel
+          mosaicFrame = renderView ViewMosaic foldedModel
+          renderOk = not (T.null graphFrame) && not (T.null zenFrame) && not (T.null mosaicFrame)
+
+          allOk = exitOk && decodingOk && outcomeOk && countsOk && renderOk
+      if allOk
+        then putStrLn "  Non-Haskell compiler producer integration tests: PASS"
+        else putStrLn "  Non-Haskell compiler producer integration tests: FAIL"
+      pure allOk
+
+-- | Comprehensive verification of Windows portability and Editor/LSP protocol integration (§7, §23).
+runWindowsAndEditorProtocolTests :: IO Bool
+runWindowsAndEditorProtocolTests = do
+  putStrLn "Running Windows portability & Editor/LSP protocol integration tests (§7, §23)..."
+  -- 1. Windows Named Pipe path translation
+  let pipePath = resolveIpcPath "test-session"
+      pipeOk = not (null pipePath)
+      transportType = detectIpcTransport pipePath
+      transportOk = transportType == if isWindowsHost then TransportWindowsNamedPipe else TransportUnixSocket
+
+  -- 2. Windows process model & console VT API
+  vtOk <- enableVirtualTerminalProcessing
+  let procModelOk = isWindowsProcessModel == isWindowsHost
+
+  -- 3. Editor protocol diagnostic conversion
+  let sampleDiag = DiagnosticPayload SeverityError (Just 12345) (SourceSpan "src/A.hs" 10 5 10 20) ["Message"] ["Hint"] Nothing
+      lspDiag = diagnosticToLsp sampleDiag
+      lspDiagOk = ldSeverity lspDiag == LspSeverityError
+               && ldCode lspDiag == Just (LspCodeInt 12345)
+               && lpLine (lrStart (ldRange lspDiag)) == 9
+               && lpCharacter (lrStart (ldRange lspDiag)) == 4
+
+  -- 4. Event to editor messages conversion
+  let evDiag = mkEvent 1 100 SrcGhc ValueReported (PayloadDiagnostic (Just "unit-1") sampleDiag)
+      editorMsgs = eventToEditorMessages evDiag
+      editorEvOk = case editorMsgs of
+        [EditorPublishDiagnostics params] -> lpUri params == "file://src/A.hs" && length (lpDiagnostics params) == 1
+        _                                 -> False
+
+  let allOk = pipeOk && transportOk && vtOk && procModelOk && lspDiagOk && editorEvOk
+  if allOk
+    then putStrLn "  Windows portability & Editor/LSP protocol tests: PASS"
+    else putStrLn "  Windows portability & Editor/LSP protocol tests: FAIL"
+  pure allOk
+
 main :: IO ()
 main = do
   putStrLn "=========================================================="
@@ -936,6 +1117,9 @@ main = do
   sigOk <- runSignalAndCancellationTests
   termOk <- runTerminalAndResizeTests
   cabalCmdOk <- runCabalExternalCommandTests
+  winEditorOk <- runWindowsAndEditorProtocolTests
+  nonHaskellOk <- runNonHaskellProducerTests
+  benchOk <- runBenchmarkSuite
 
   res1 <- quickCheckResult (withNumTests 100 prop_eventJsonRoundTrip)
   res2 <- quickCheckResult (withNumTests 200 prop_barWidthRespectsBounds)
@@ -972,8 +1156,15 @@ main = do
   res33 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsDoubleDash)
   res34 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsQueryDetection)
   res35 <- quickCheckResult (withNumTests 100 prop_partitionCliArgsSubcommands)
+  res36 <- quickCheckResult (withNumTests 100 prop_calculatePercentileBounded)
+  res37 <- quickCheckResult (withNumTests 100 prop_computeBuildOverheadLinear)
+  res38 <- quickCheckResult (withNumTests 100 prop_estimateCpuUsageLinear)
+  res39 <- quickCheckResult (withNumTests 100 prop_spanToLspRangeZeroIndexed)
+  res40 <- quickCheckResult (withNumTests 100 prop_editorMessageJsonRoundTrip)
+  res41 <- quickCheckResult (withNumTests 50 prop_detectIpcTransportSound)
+  res42 <- quickCheckResult (withNumTests 100 prop_handleTuiKeySound)
 
-  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk && cabalCmdOk
+  let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk && cabalCmdOk && winEditorOk && nonHaskellOk && benchOk
                       && isSuccess res1 && isSuccess res2 && isSuccess res3
                       && isSuccess res4 && isSuccess res5 && isSuccess res6
                       && isSuccess res7 && isSuccess res8 && isSuccess res9
@@ -985,7 +1176,9 @@ main = do
                       && isSuccess res25 && isSuccess res26 && isSuccess res27
                       && isSuccess res28 && isSuccess res29 && isSuccess res30
                       && isSuccess res31 && isSuccess res32 && isSuccess res33
-                      && isSuccess res34 && isSuccess res35
+                      && isSuccess res34 && isSuccess res35 && isSuccess res36
+                      && isSuccess res37 && isSuccess res38 && isSuccess res39
+                      && isSuccess res40 && isSuccess res41 && isSuccess res42
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

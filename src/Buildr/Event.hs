@@ -41,6 +41,7 @@ module Buildr.Event
   , formatDiagnosticWithStyle
   ) where
 
+import Control.Applicative ((<|>))
 import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?), (.=), object, withObject, encode, decodeStrict)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
@@ -88,6 +89,7 @@ instance FromJSON EventSource where
     "graph"   -> pure SrcGraph
     "history" -> pure SrcHistory
     "buildr"  -> pure SrcBuildr
+    "clang"   -> pure SrcGhc
     other     -> fail ("Unknown event source: " <> T.unpack other)
 
 -- | The epistemological kind of the event payload, enforcing the Honesty Contract.
@@ -212,10 +214,13 @@ instance ToJSON BuildOutcome where
 
 instance FromJSON BuildOutcome where
   parseJSON = Aeson.withText "BuildOutcome" $ \case
-    "success"   -> pure BuildSuccess
-    "failed"    -> pure BuildFailed
-    "cancelled" -> pure BuildCancelled
-    other       -> fail ("Unknown build outcome: " <> T.unpack other)
+    "success"        -> pure BuildSuccess
+    "BuildSuccess"   -> pure BuildSuccess
+    "failed"         -> pure BuildFailed
+    "BuildFailed"    -> pure BuildFailed
+    "cancelled"      -> pure BuildCancelled
+    "BuildCancelled" -> pure BuildCancelled
+    other            -> fail ("Unknown build outcome: " <> T.unpack other)
 
 -- | Summary module counts at build completion.
 data BuildCounts = BuildCounts
@@ -226,8 +231,23 @@ data BuildCounts = BuildCounts
   , countSkipped    :: !Int
   } deriving (Eq, Show, Generic)
 
-instance ToJSON BuildCounts
-instance FromJSON BuildCounts
+instance ToJSON BuildCounts where
+  toJSON bc = object
+    [ "countDone"       .= countDone bc
+    , "countFailed"     .= countFailed bc
+    , "countBlocked"    .= countBlocked bc
+    , "countNotReached" .= countNotReached bc
+    , "countSkipped"    .= countSkipped bc
+    ]
+
+instance FromJSON BuildCounts where
+  parseJSON = withObject "BuildCounts" $ \o ->
+    BuildCounts
+      <$> (o .: "countDone" <|> o .: "bcDone" <|> o .: "done")
+      <*> (o .: "countFailed" <|> o .: "bcFailed" <|> o .: "failed")
+      <*> (o .: "countBlocked" <|> o .: "bcBlocked" <|> o .: "blocked")
+      <*> (o .: "countNotReached" <|> o .: "bcNotReached" <|> o .: "notReached")
+      <*> (o .: "countSkipped" <|> o .: "bcSkipped" <|> o .: "skipped")
 
 -- | The closed set of event payload schemas supported in Protocol v1.
 data EventPayload
@@ -290,7 +310,9 @@ instance FromJSON EventPayload where
   parseJSON = withObject "EventPayload" $ \o -> do
     kind <- o .: "kind"
     case (kind :: Text) of
-      "BuildStarted"   -> PayloadBuildStarted <$> o .: "buildr" <*> o .: "cabal" <*> o .: "ghc"
+      "BuildStarted"   -> PayloadBuildStarted <$> (o .: "buildr" <|> o .: "buildrVersion")
+                                              <*> (o .: "cabal" <|> o .: "cabalVersion")
+                                              <*> (o .: "ghc" <|> o .: "ghcVersion")
       "PlanReady"      -> PayloadPlanReady <$> o .: "units"
       "GraphKnown"     -> PayloadGraphKnown <$> o .: "unit" <*> o .: "modules" <*> o .: "edges"
       "UnitStarted"    -> PayloadUnitStarted <$> o .: "unit"
@@ -298,16 +320,17 @@ instance FromJSON EventPayload where
       "UnitFailed"     -> PayloadUnitFailed <$> o .: "unit" <*> o .: "exitCode" <*> o .:? "log"
       "UnitStopped"    -> PayloadUnitStopped <$> o .: "unit"
       "ModuleStarted"  -> PayloadModuleStarted <$> o .: "unit" <*> o .: "module" <*> o .: "k" <*> o .: "n"
-                            <*> o .: "src" <*> o .: "obj" <*> o .:? "reason"
+                            <*> (o .: "source" <|> o .: "sourcePath" <|> o .: "srcPath" <|> o .: "src")
+                            <*> o .: "obj" <*> o .:? "reason"
       "ModulePhase"    -> PayloadModulePhase <$> o .: "unit" <*> o .: "module" <*> o .: "phase"
                             <*> o .: "ms" <*> o .: "alloc"
       "ModuleFinished" -> PayloadModuleFinished <$> o .: "unit" <*> o .: "module"
       "ModuleSkipped"  -> PayloadModuleSkipped <$> o .: "unit" <*> o .: "module" <*> o .: "reason"
-      "Diagnostic"     -> PayloadDiagnostic <$> o .:? "unit" <*> o .: "diag"
+      "Diagnostic"     -> PayloadDiagnostic <$> o .:? "unit" <*> (o .: "diag" <|> o .: "diagnostic")
       "Opaque"         -> PayloadOpaque <$> o .:? "unit" <*> o .: "stream" <*> o .: "lines" <*> o .: "class"
       "SlotsChanged"   -> PayloadSlotsChanged <$> o .: "busy" <*> o .: "total"
       "Linking"        -> PayloadLinking <$> o .: "unit" <*> o .: "target"
-      "BuildDone"      -> PayloadBuildDone <$> o .: "outcome" <*> o .: "counts" <*> o .: "wallTimeNs"
+      "BuildDone"      -> PayloadBuildDone <$> o .: "outcome" <*> o .: "counts" <*> (o .: "wallTimeNs" <|> o .: "wallNs")
       other            -> fail ("Unrecognised event kind: " <> T.unpack other)
 
 -- | The canonical Event Protocol v1 envelope.

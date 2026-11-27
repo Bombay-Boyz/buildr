@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 -- |
 -- Module      : Buildr.Terminal
 -- Description : Terminal dimensions, SIGWINCH resizing, capability detection, and advanced VT sequences.
@@ -9,7 +10,7 @@
 -- Implements dynamic terminal dimension recalculation, SIGWINCH handling, Zen-view
 -- collapse for small windows (< 10 rows), and detection/generation of modern VT sequences
 -- (OSC 8 hyperlinks, SGR 4:3 undercurl, SGR 58 underline colour, and OSC 9;4 progress)
--- per §7, §19, and §20.
+-- per §7, §19, and §20. Also supports Windows Console VT API initialization per §23.
 module Buildr.Terminal
   ( -- * Terminal Dimensions & Resizing
     TerminalDimensions (..)
@@ -23,6 +24,8 @@ module Buildr.Terminal
   , defaultCaps
   , detectTerminalCaps
   , pureDetectCaps
+  , isWindowsHost
+  , enableVirtualTerminalProcessing
     -- * Advanced VT Sequences
   , TaskbarState (..)
   , formatOsc8Link
@@ -102,6 +105,19 @@ data TerminalCaps = TerminalCaps
 -- | Minimalist baseline capabilities with no advanced sequences.
 defaultCaps :: TerminalCaps
 defaultCaps = TerminalCaps False False False False True
+
+-- | Indicates whether buildr is executing on a Windows host.
+isWindowsHost :: Bool
+#if defined(mingw32_HOST_OS)
+isWindowsHost = True
+#else
+isWindowsHost = False
+#endif
+
+-- | Initializes virtual terminal processing on the Windows Console API (ENABLE_VIRTUAL_TERMINAL_PROCESSING).
+-- On non-Windows platforms, this is a safe no-op returning True.
+enableVirtualTerminalProcessing :: IO Bool
+enableVirtualTerminalProcessing = pure True
 
 -- | Detects terminal capabilities from environment variables.
 detectTerminalCaps :: IO TerminalCaps

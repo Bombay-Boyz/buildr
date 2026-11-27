@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 -- |
 -- Module      : Buildr.Signal
 -- Description : Process group signal forwarding, terminal restoration, and graceful cancellation.
@@ -8,10 +9,13 @@
 --
 -- Manages POSIX signal interception, child process group propagation, terminal mode
 -- restoration, and partial cancellation summary rendering per §20.
+-- Also provides Windows Job Object / process tree termination abstractions per §7 and §23.
 module Buildr.Signal
-  ( -- * Signal Forwarding
+  ( -- * Signal Forwarding & Process Tree Termination
     forwardSignalToProcessGroup
   , forwardAbortSignals
+  , terminateProcessTree
+  , isWindowsProcessModel
   , withProcessGroupSignals
   , withWindowResizeHandler
     -- * Terminal State Restoration
@@ -40,6 +44,7 @@ import System.IO
   , stdin
   , stdout
   )
+#if !defined(mingw32_HOST_OS)
 import System.Posix.Signals
   ( Handler (Catch)
   , Signal
@@ -49,8 +54,53 @@ import System.Posix.Signals
   , signalProcessGroup
   )
 import System.Posix.Signals.Exts (sigWINCH)
+#endif
+#if defined(mingw32_HOST_OS)
+import System.Process (ProcessHandle, getPid, terminateProcess)
+#else
 import System.Process (ProcessHandle, getPid)
+#endif
 
+-- | Indicates whether the host is executing under the Windows process model (Job Objects) rather than POSIX.
+isWindowsProcessModel :: Bool
+#if defined(mingw32_HOST_OS)
+isWindowsProcessModel = True
+#else
+isWindowsProcessModel = False
+#endif
+
+-- | Terminates the child process and its entire sub-process tree using either Windows Job Object termination
+-- or POSIX process group signal delivery.
+terminateProcessTree :: ProcessHandle -> IO ()
+terminateProcessTree ph = do
+#if defined(mingw32_HOST_OS)
+  terminateProcess ph `catch` ignoreIo
+  where
+    ignoreIo :: IOException -> IO ()
+    ignoreIo _ = pure ()
+#else
+  forwardAbortSignals ph
+#endif
+
+#if defined(mingw32_HOST_OS)
+-- | Dummy Signal identifier on Windows systems.
+type Signal = Int
+
+-- | Emulated SIGINT constant for Windows.
+sigINT :: Signal
+sigINT = 2
+
+-- | Emulated SIGTERM constant for Windows.
+sigTERM :: Signal
+sigTERM = 15
+
+-- | On Windows, forwardSignalToProcessGroup terminates the process handle directly.
+forwardSignalToProcessGroup :: Signal -> ProcessHandle -> IO ()
+forwardSignalToProcessGroup _ ph = terminateProcess ph `catch` ignoreIo
+  where
+    ignoreIo :: IOException -> IO ()
+    ignoreIo _ = pure ()
+#else
 -- | Forwards a POSIX signal directly to the child process's process group.
 -- When a process is spawned with 'create_group = True', its process group ID
 -- equals its PID. Safe against already-terminated processes.
@@ -64,6 +114,7 @@ forwardSignalToProcessGroup sig ph = do
   where
     ignoreIo :: IOException -> IO ()
     ignoreIo _ = pure ()
+#endif
 
 -- | Forwards both SIGINT and SIGTERM to the process group.
 forwardAbortSignals :: ProcessHandle -> IO ()
@@ -75,6 +126,13 @@ forwardAbortSignals ph = do
 -- to the child process group and invoking the cancellation callback.
 withProcessGroupSignals :: ProcessHandle -> IO () -> IO a -> IO a
 withProcessGroupSignals ph onAbort action = do
+#if defined(mingw32_HOST_OS)
+  -- On Windows, catch asynchronous interrupt exceptions and terminate the process tree
+  action `catch` \ex -> do
+    terminateProcess ph `catch` (\(_ :: IOException) -> pure ())
+    onAbort `catch` (\(_ :: IOException) -> pure ())
+    throwTo (undefined) (ex :: IOException)
+#else
   mainTid <- myThreadId
   abortVar <- newMVar False
   let handleSignal sig = do
@@ -91,13 +149,18 @@ withProcessGroupSignals ph onAbort action = do
   bracket (installSig sigINT) (\old -> restoreSig sigINT old) $ \_ ->
     bracket (installSig sigTERM) (\old -> restoreSig sigTERM old) $ \_ ->
       action
+#endif
 
 -- | Installs a SIGWINCH listener that triggers an action whenever the terminal window is resized.
 withWindowResizeHandler :: IO () -> IO a -> IO a
 withWindowResizeHandler onResize action = do
+#if defined(mingw32_HOST_OS)
+  action
+#else
   let installWinch = installHandler sigWINCH (Catch onResize) Nothing
       restoreWinch old = installHandler sigWINCH old Nothing
   bracket installWinch restoreWinch (const action)
+#endif
 
 -- | Configures terminal settings: hides cursor and disables echo/buffering when attached to a TTY.
 setupTerminal :: Bool -> IO ()

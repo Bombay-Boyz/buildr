@@ -2,6 +2,13 @@ cabal-version:      3.0
 name:               buildr
 version:            0.1.0.0
 synopsis:           A compilation renderer and build front-end for Haskell
+description:
+    buildr is a high-performance build front-end and visual compilation interface
+    for Haskell (GHC 9.10+ and cabal-install). It replaces traditional wall-of-text
+    compiler output with live interactive dependency frontiers, 20-cell progress
+    metrics, structured diagnostics, and high-fidelity terminal rendering.
+    Governed by the Haskell Engineering Standard and implementing the Event Protocol v1
+    and Visual Grammar v1 specifications.
 license:            MIT
 license-file:       LICENSE
 author:             bombay boyz
@@ -9,13 +16,23 @@ maintainer:         259497327+Bombay-Boyz@users.noreply.github.com
 copyright:          2026 bombay boyz
 category:           Development
 build-type:         Simple
-extra-doc-files:    CHANGELOG.md
+extra-doc-files:
+    README.md
+    CHANGELOG.md
+
+source-repository head
+    type:     git
+    location: https://github.com/Bombay-Boyz/buildr
+
+flag dev
+    description: Enable -Werror for development builds
+    default:     False
+    manual:      True
 
 common warnings
     ghc-options:
       -Wall
       -Wcompat
-      -Werror
       -Wincomplete-uni-patterns
       -Wincomplete-record-updates
       -Wmissing-export-lists
@@ -26,6 +43,8 @@ common warnings
       -Wredundant-constraints
       -Wpartial-fields
       -Widentities
+    if flag(dev)
+      ghc-options: -Werror
     default-language:   GHC2021
     default-extensions:
       StrictData
@@ -36,9 +55,11 @@ common warnings
 library
     import:           warnings
     exposed-modules:
+        Buildr.Benchmark
         Buildr.Cli
         Buildr.Config
         Buildr.Core
+        Buildr.Editor
         Buildr.Error
         Buildr.Event
         Buildr.Grammar
@@ -120,4 +141,5 @@ test-suite buildr-test
         terminal-size,
         QuickCheck >=2.14 && <2.20,
         text,
+        time,
         unix

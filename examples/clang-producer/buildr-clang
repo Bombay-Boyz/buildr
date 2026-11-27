@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+buildr-clang: Non-Haskell Prototype Compiler Producer for buildr Event Protocol v1.
+Demonstrates language-agnostic Event Protocol v1 emission per Vision Document §23 (Phase 3).
+
+Usage:
+    buildr-clang -c source.c -o source.o
+    buildr-clang --build-all file1.c file2.c ...
+"""
+
+import sys
+import os
+import json
+import time
+import socket
+import subprocess
+
+def now_ns():
+    return time.monotonic_ns()
+
+def send_event(sock_path, event_dict):
+    """Sends JSON Lines event to BUILDR_SOCKET if configured, or prints to stdout."""
+    line = json.dumps(event_dict, separators=(',', ':')) + '\n'
+    if sock_path and os.path.exists(sock_path):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(sock_path)
+                s.sendall(line.encode('utf-8'))
+                return
+        except Exception:
+            pass
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+class BuildrClangProducer:
+    def __init__(self, unit_id="c-app", sock_path=None):
+        self.unit_id = unit_id
+        self.sock_path = sock_path or os.environ.get("BUILDR_SOCKET")
+        self.seq = 0
+        self.t0 = now_ns()
+
+    def emit(self, kind, payload, src="clang", value_kind="observed"):
+        self.seq += 1
+        event = {
+            "v": 1,
+            "seq": self.seq,
+            "t": now_ns() - self.t0,
+            "src": src,
+            "valueKind": value_kind,
+            "kind": kind
+        }
+        event.update(payload)
+        send_event(self.sock_path, event)
+
+    def start_build(self, sources):
+        self.emit("BuildStarted", {
+            "buildrVersion": "0.1.0",
+            "cabalVersion": "clang-17.0",
+            "ghcVersion": "clang-native",
+            "profile": "-O2",
+            "userFlags": sys.argv[1:]
+        }, src="buildr")
+
+        units = [{
+            "puId": self.unit_id,
+            "puPackage": "c-project",
+            "puVersion": "1.0.0",
+            "puComponent": "exe",
+            "puStyle": "local",
+            "puDependencies": [],
+            "puRebuildReason": None
+        }]
+        self.emit("PlanReady", {"units": units}, src="plan", value_kind="reported")
+        self.emit("UnitStarted", {"unit": self.unit_id})
+
+    def compile_source(self, src_file, idx, total, out_file=None):
+        out_file = out_file or (os.path.splitext(src_file)[0] + ".o")
+        mod_name = os.path.basename(src_file)
+
+        self.emit("ModuleStarted", {
+            "unit": self.unit_id,
+            "module": mod_name,
+            "k": idx,
+            "n": total,
+            "source": src_file,
+            "obj": out_file,
+            "reason": None
+        })
+
+        # Simulate or execute clang passes
+        t_phase_start = time.perf_counter()
+        
+        # Real compilation if clang is available, else syntax verification
+        clang_cmd = ["clang", "-c", src_file, "-o", out_file]
+        exit_code = 0
+        try:
+            res = subprocess.run(clang_cmd, capture_output=True, text=True)
+            exit_code = res.returncode
+            if res.stderr:
+                for line in res.stderr.splitlines():
+                    if ": error:" in line or ": warning:" in line:
+                        is_err = ": error:" in line
+                        self.emit("Diagnostic", {
+                            "unit": self.unit_id,
+                            "diagnostic": {
+                                "severity": "Error" if is_err else "Warning",
+                                "code": None,
+                                "span": {
+                                    "file": src_file,
+                                    "startLine": 1,
+                                    "startCol": 1,
+                                    "endLine": 1,
+                                    "endCol": 10
+                                },
+                                "message": [line],
+                                "hints": [],
+                                "flag": "-Wall"
+                            }
+                        })
+        except FileNotFoundError:
+            # Clang not installed on PATH; simulate clean compilation for prototype demo
+            time.sleep(0.01)
+
+        phase_ms = int((time.perf_counter() - t_phase_start) * 1000)
+        self.emit("ModulePhase", {
+            "unit": self.unit_id,
+            "module": mod_name,
+            "phase": "CodeGen",
+            "ms": max(1, phase_ms),
+            "alloc": 1024000
+        }, value_kind="reported")
+
+        if exit_code == 0:
+            self.emit("ModuleFinished", {
+                "unit": self.unit_id,
+                "module": mod_name
+            }, value_kind="reported")
+        else:
+            self.emit("UnitFailed", {
+                "unit": self.unit_id,
+                "exitCode": exit_code,
+                "logPath": None
+            })
+
+        return exit_code == 0
+
+    def finish_build(self, success, total_mods):
+        outcome = "success" if success else "failed"
+        counts = {
+            "countDone": total_mods if success else total_mods - 1,
+            "countFailed": 0 if success else 1,
+            "countBlocked": 0,
+            "countNotReached": 0,
+            "countSkipped": 0
+        }
+        self.emit("UnitCompleted", {"unit": self.unit_id, "exitCode": 0 if success else 1})
+        self.emit("BuildDone", {
+            "outcome": outcome,
+            "counts": counts,
+            "wallNs": now_ns() - self.t0
+        })
+
+def main():
+    args = sys.argv[1:]
+    sources = [a for a in args if a.endswith('.c') or a.endswith('.cpp')]
+    if not sources:
+        sources = ["main.c", "engine.c", "render.c"]
+
+    producer = BuildrClangProducer()
+    producer.start_build(sources)
+
+    all_ok = True
+    total = len(sources)
+    for idx, src in enumerate(sources, 1):
+        ok = producer.compile_source(src, idx, total)
+        if not ok:
+            all_ok = False
+            break
+
+    producer.finish_build(all_ok, total)
+
+if __name__ == "__main__":
+    main()

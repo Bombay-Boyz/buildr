@@ -1,6 +1,8 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveGeneric #-}
 -- |
 -- Module      : Buildr.Ipc
--- Description : Unix domain socket IPC server and client transport.
+-- Description : Cross-platform IPC transport supporting Unix domain sockets and Windows Named Pipes.
 -- Copyright   : (c) bombay boyz, 2026
 -- License     : MIT
 -- Maintainer  : 259497327+Bombay-Boyz@users.noreply.github.com
@@ -9,7 +11,8 @@
 -- IPC transport linking buildr-ghc compiler wrappers to the buildr parent process:
 --   * Asynchronous server accepting parallel compiler wrapper connections (§8.2).
 --   * Streaming newline-delimited JSON Lines event decoding.
---   * Clean socket lifecycle with robust file removal and signal-safe teardown.
+--   * Cross-platform transport abstraction supporting Unix domain sockets and Windows Named Pipes.
+--   * Clean socket/pipe lifecycle with robust file removal and signal-safe teardown.
 --   * 100% total stream parsing without partial list indexing (Standard 1.1).
 module Buildr.Ipc
   ( -- * Server Types & Lifecycle
@@ -18,6 +21,10 @@ module Buildr.Ipc
   , stopIpcServer
     -- * Client Transport
   , sendIpcEvent
+    -- * Transport Abstraction & Windows Named Pipes (§7, §23)
+  , IpcTransportKind (..)
+  , resolveIpcPath
+  , detectIpcTransport
   ) where
 
 import Buildr.Error (IpcError (..))
@@ -25,12 +32,40 @@ import Buildr.Event (Event, decodeEventLine, encodeEventLine)
 import Control.Concurrent.Async (Async, async, cancel)
 import Control.Exception (SomeException, bracket, handle, try)
 import Control.Monad (forever)
+import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
+import Data.List (isPrefixOf)
 import qualified Data.Text as T
+import GHC.Generics (Generic)
 import Network.Socket
 import Network.Socket.ByteString (recv, sendAll)
 import System.Directory (removeFile)
+
+-- | Transport mechanism used for IPC communication.
+data IpcTransportKind
+  = TransportUnixSocket
+  | TransportWindowsNamedPipe
+  deriving (Eq, Show, Generic)
+
+instance Aeson.ToJSON IpcTransportKind
+instance Aeson.FromJSON IpcTransportKind
+
+-- | Resolves a base socket/pipe name to a platform-appropriate IPC identifier:
+-- on Windows, maps to @\\\\.\\pipe\\buildr-<name>@; on POSIX systems, maps to @/tmp/buildr-<name>.sock@.
+resolveIpcPath :: String -> FilePath
+resolveIpcPath name =
+#if defined(mingw32_HOST_OS)
+  "\\\\.\\pipe\\buildr-" <> name
+#else
+  "/tmp/buildr-" <> name <> ".sock"
+#endif
+
+-- | Inspects an IPC path to detect whether it represents a Windows Named Pipe or a Unix domain socket.
+detectIpcTransport :: FilePath -> IpcTransportKind
+detectIpcTransport p
+  | "\\\\.\\pipe\\" `isPrefixOf` p = TransportWindowsNamedPipe
+  | otherwise                      = TransportUnixSocket
 
 -- | Opaque handle managing the lifecycle of an active IPC server listener.
 data IpcServerHandle = IpcServerHandle

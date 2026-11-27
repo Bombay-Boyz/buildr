@@ -21,6 +21,11 @@ module Buildr.Cli
   , StatsOpts (..)
   , ThemeOpts (..)
   , CliInvocation (..)
+    -- * Interactive TUI State & Keyboard Controls (§12.6)
+  , TuiState (..)
+  , KeyEvent (..)
+  , defaultTuiState
+  , handleTuiKey
     -- * Pure Argument Partitioning (§18)
   , partitionCliArgs
   , isCabalQueryArg
@@ -600,7 +605,7 @@ runDoctor = do
 -- | Replays a recorded Event Protocol v1 JSON log file through the pure model.
 runReplay :: FilePath -> ViewMode -> IO ()
 runReplay filePath viewMode = do
-  content <- BS.readFile filePath
+  content <- if filePath == "-" then BS.getContents else BS.readFile filePath
   let rawLines = BSC8.lines content
       events = mapMaybe decodeEventLine rawLines
   if null events && not (null rawLines)
@@ -862,13 +867,36 @@ data TuiState = TuiState
   , tsDimensions   :: !TerminalDimensions
   } deriving (Eq, Show)
 
+-- | Default initial state for the interactive TUI.
+defaultTuiState :: TerminalDimensions -> ViewMode -> TuiState
+defaultTuiState dims mode = TuiState
+  { tsViewMode     = mode
+  , tsShowWarnings = True
+  , tsSelectedRow  = 0
+  , tsDetached     = False
+  , tsDimensions   = dims
+  }
+
 -- | Keyboard event parsed from raw terminal input.
 data KeyEvent
   = KeyUp
   | KeyDown
+  | KeyEnter
   | KeyChar !Char
   | KeyOther
   deriving (Eq, Show)
+
+-- | Pure state transition for interactive key events (§12.6).
+handleTuiKey :: KeyEvent -> TuiState -> TuiState
+handleTuiKey ev s = case ev of
+  KeyChar 'g' -> s { tsViewMode = ViewGraph }
+  KeyChar 'm' -> s { tsViewMode = ViewMosaic }
+  KeyChar 'z' -> s { tsViewMode = ViewZen }
+  KeyChar 't' -> s { tsShowWarnings = not (tsShowWarnings s) }
+  KeyUp       -> s { tsSelectedRow = max 0 (tsSelectedRow s - 1) }
+  KeyDown     -> s { tsSelectedRow = tsSelectedRow s + 1 }
+  KeyChar 'q' -> s { tsDetached = True }
+  _           -> s
 
 -- | Non-blocking key event reader.
 readKeyNonBlocking :: IO (Maybe KeyEvent)
@@ -878,26 +906,28 @@ readKeyNonBlocking = do
     then pure Nothing
     else do
       c <- getChar
-      if c == '\ESC'
-        then do
-          r2 <- hReady stdin
-          if not r2
-            then pure (Just (KeyChar '\ESC'))
-            else do
-              c2 <- getChar
-              if c2 == '['
-                then do
-                  r3 <- hReady stdin
-                  if not r3
-                    then pure (Just KeyOther)
-                    else do
-                      c3 <- getChar
-                      case c3 of
-                        'A' -> pure (Just KeyUp)
-                        'B' -> pure (Just KeyDown)
-                        _   -> pure (Just KeyOther)
-                else pure (Just KeyOther)
-        else pure (Just (KeyChar c))
+      if c == '\n' || c == '\r'
+        then pure (Just KeyEnter)
+        else if c == '\ESC'
+          then do
+            r2 <- hReady stdin
+            if not r2
+              then pure (Just (KeyChar '\ESC'))
+              else do
+                c2 <- getChar
+                if c2 == '['
+                  then do
+                    r3 <- hReady stdin
+                    if not r3
+                      then pure (Just KeyOther)
+                      else do
+                        c3 <- getChar
+                        case c3 of
+                          'A' -> pure (Just KeyUp)
+                          'B' -> pure (Just KeyDown)
+                          _   -> pure (Just KeyOther)
+                  else pure (Just KeyOther)
+          else pure (Just (KeyChar c))
 
 -- | Interactive keyboard control loop for TTY sessions (§12.6, §14, §15).
 interactiveInputLoop :: MVar TuiState -> MVar BuildModel -> IO ()
@@ -910,11 +940,24 @@ interactiveInputLoop tuiVar modelVar = forever $ do
   where
     handleKey = \case
       KeyChar 'q' -> do
-        modifyMVar_ tuiVar (\s -> pure s { tsDetached = True })
+        modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 'q') s))
         putStr "\nbuildr: detached display. Compilation continuing in background...\n"
         hFlush stdout
-      KeyUp       -> modifyMVar_ tuiVar (\s -> pure s { tsSelectedRow = max 0 (tsSelectedRow s - 1) })
-      KeyDown     -> modifyMVar_ tuiVar (\s -> pure s { tsSelectedRow = tsSelectedRow s + 1 })
+      KeyUp       -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey KeyUp s))
+      KeyDown     -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey KeyDown s))
+      KeyChar 'g' -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 'g') s))
+      KeyChar 'm' -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 'm') s))
+      KeyChar 'z' -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 'z') s))
+      KeyChar 't' -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 't') s))
+      KeyEnter    -> do
+        s <- readMVar tuiVar
+        m <- readMVar modelVar
+        case bmDiagnostics m of
+          (d:_) -> do
+            putStrLn ("\n--- Diagnostic for selected module [" <> show (tsSelectedRow s) <> "] ---")
+            TIO.putStrLn (T.intercalate "\n" (diagMessage d))
+            hFlush stdout
+          [] -> pure ()
       KeyChar 'x' -> do
         m <- readMVar modelVar
         case bmDiagnostics m of
