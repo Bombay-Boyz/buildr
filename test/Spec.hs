@@ -27,6 +27,7 @@ import qualified Data.ByteString.Char8 as BSC8
 import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -1025,6 +1026,7 @@ prop_handleTuiKeySound = property $
       sm = handleTuiKey (KeyChar 'm') s0
       sz = handleTuiKey (KeyChar 'z') s0
       st = handleTuiKey (KeyChar 't') s0
+      sr = handleTuiKey (KeyChar 'r') s0
       sDown = handleTuiKey KeyDown s0
       sUp = handleTuiKey KeyUp sDown
       sUpBound = handleTuiKey KeyUp s0
@@ -1033,10 +1035,33 @@ prop_handleTuiKeySound = property $
   && tsViewMode sm == ViewMosaic
   && tsViewMode sz == ViewZen
   && tsShowWarnings st == not (tsShowWarnings s0)
+  && tsShowRawGhc sr == not (tsShowRawGhc s0)
   && tsSelectedRow sDown == 1
   && tsSelectedRow sUp == 0
   && tsSelectedRow sUpBound == 0
   && tsDetached sq == True
+
+-- | Property 43: GitHub Actions Plain CI view emits ::error:: and ::warning:: annotations (§19).
+prop_renderPlainViewCiEmitsAnnotations :: Property
+prop_renderPlainViewCiEmitsAnnotations = property $
+  let span1 = SourceSpan "src/Main.hs" 10 5 10 20
+      diagErr = DiagnosticPayload SeverityError (Just 12345) span1 ["Syntax error: missing semicolon"] [] Nothing
+      diagWarn = DiagnosticPayload SeverityWarning Nothing span1 ["Unused variable 'x'"] [] Nothing
+      modelWithErr = initialModel { bmDiagnostics = [diagErr] }
+      modelWithWarn = initialModel { bmDiagnostics = [diagWarn] }
+      outErr = renderPlainViewCi modelWithErr
+      outWarn = renderPlainViewCi modelWithWarn
+  in T.isInfixOf "::error file=src/Main.hs,line=10,col=5::Syntax error: missing semicolon" outErr
+  && T.isInfixOf "::warning file=src/Main.hs,line=10,col=5::Unused variable 'x'" outWarn
+
+-- | Property 44: Summary block renders specific target rebuild suggestions when failures exist (§16).
+prop_summaryBlockFailedUnitsRebuildSuggestion :: Property
+prop_summaryBlockFailedUnitsRebuildSuggestion = property $
+  let modFailed = ModuleInfo "App.Main" "lib:my-app" (ModFailed 1) Set.empty False Map.empty
+      unitWithFail = UnitInfo "lib:my-app" "my-app" (UnitBuilding 0) (Map.singleton "App.Main" modFailed)
+      modelFailed = initialModel { bmUnits = Map.singleton "lib:my-app" unitWithFail }
+      summaryText = renderSummaryBlock modelFailed 1000000
+  in T.isInfixOf "Next steps: Run 'buildr build lib:my-app --keep-going'" summaryText
 
 -- | Comprehensive verification of non-Haskell Event Protocol v1 producer integration (§23 Phase 3).
 runNonHaskellProducerTests :: IO Bool
@@ -1169,6 +1194,8 @@ main = do
   res40 <- quickCheckResult (withNumTests 100 prop_editorMessageJsonRoundTrip)
   res41 <- quickCheckResult (withNumTests 50 prop_detectIpcTransportSound)
   res42 <- quickCheckResult (withNumTests 100 prop_handleTuiKeySound)
+  res43 <- quickCheckResult (withNumTests 100 prop_renderPlainViewCiEmitsAnnotations)
+  res44 <- quickCheckResult (withNumTests 100 prop_summaryBlockFailedUnitsRebuildSuggestion)
 
   let allPassed = bOk && planOk && ipcOk && goldenOk && cfgOk && sigOk && termOk && cabalCmdOk && winEditorOk && nonHaskellOk && benchOk
                       && isSuccess res1 && isSuccess res2 && isSuccess res3
@@ -1185,6 +1212,7 @@ main = do
                       && isSuccess res34 && isSuccess res35 && isSuccess res36
                       && isSuccess res37 && isSuccess res38 && isSuccess res39
                       && isSuccess res40 && isSuccess res41 && isSuccess res42
+                      && isSuccess res43 && isSuccess res44
   if allPassed
     then do
       putStrLn "\nAll QuickCheck properties, IPC tests, and boundary invariants PASSED."

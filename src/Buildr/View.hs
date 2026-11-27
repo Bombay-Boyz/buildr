@@ -36,7 +36,13 @@ module Buildr.View
   , computeCriticalPath
   ) where
 
-import Buildr.Event (BuildOutcome (..), formatDiagnostic)
+import Buildr.Event
+  ( BuildOutcome (..)
+  , DiagnosticPayload (..)
+  , DiagnosticSeverity (..)
+  , SourceSpan (..)
+  , formatDiagnostic
+  )
 import Buildr.Grammar
 import Buildr.Model
 import Buildr.Terminal
@@ -224,7 +230,7 @@ renderPlainView model =
                       else "\n--- Diagnostics ---\n" <> T.concat (map formatDiagnostic (reverse diags))
   in T.concat (map renderUnitPlain units) <> diagSection
 
--- | Renders the Plain view tailored for GitHub Actions with collapsible groups.
+-- | Renders the Plain view tailored for GitHub Actions with collapsible groups and annotations (§19).
 renderPlainViewCi :: BuildModel -> Text
 renderPlainViewCi model =
   let units = Map.elems (bmUnits model)
@@ -236,7 +242,20 @@ renderPlainViewCi model =
         in "::group::Unit " <> uiPackage u <> " (" <> uiId u <> ")\n"
              <> T.unlines modLines
              <> "::endgroup::\n"
-  in T.concat (map renderUnitCi units)
+      diags = bmDiagnostics model
+      renderDiagCi d =
+        let sp = diagSpan d
+            file = spanFile sp
+            line = spanStartLine sp
+            col = spanStartCol sp
+            cmd = if diagSeverity d == SeverityError then "::error " else "::warning "
+            loc = "file=" <> T.pack file <> ",line=" <> T.pack (show line) <> ",col=" <> T.pack (show col) <> "::"
+            msg = T.intercalate " " (diagMessage d)
+        in cmd <> loc <> msg <> "\n"
+      diagSection = if null diags
+                      then ""
+                      else T.concat (map renderDiagCi (reverse diags))
+  in T.concat (map renderUnitCi units) <> diagSection
 
 -- | Renders the Linear accessible view designed for screen readers (§12.5).
 renderLinearView :: BuildModel -> Text
@@ -368,8 +387,15 @@ renderSummaryBlock model wallTimeNs =
                        then ""
                        else "Critical path:   " <> T.intercalate " -> " (take 6 critPath)
 
+      failedUnits = [ uiId u | u <- Map.elems (bmUnits model), any isModFailed (Map.elems (uiModules u)) ]
+      isModFailed m = case miStatus m of
+        ModFailed _ -> True
+        _           -> False
+
       nextStep = if failedCount > 0
-                   then "Next steps: Run 'buildr build --keep-going' or check compiler diagnostics above."
+                   then if not (null failedUnits)
+                          then "Next steps: Run 'buildr build " <> T.intercalate " " (take 3 failedUnits) <> " --keep-going' to rebuild failed targets."
+                          else "Next steps: Run 'buildr build --keep-going' or check compiler diagnostics above."
                    else "Build completed cleanly."
   in T.unlines
        [ "================================================================================"

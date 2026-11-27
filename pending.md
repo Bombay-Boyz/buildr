@@ -85,4 +85,26 @@ This document tracks implementation items, architectural enhancements, and bench
   - Prototype non-Haskell compiler producer [buildr-clang](file:///Users/air/Documents/seby/projects/Haskell/buildr/examples/clang-producer/buildr-clang) emitting Event Protocol v1 JSON Lines.
   - Verified with automated integration tests in `test/Spec.hs` confirming event deserialization, pure model fold, and multi-view rendering.
 - [x] **Interactive TTY Keyboard Controls (§12.6)**:
-  - Interactive key handler (`handleTuiKey`) supporting dynamic view switching (`g`/`m`/`z`), warning toggles (`t`), row navigation (`↑`/`↓`), diagnostic inspection (`⏎`), error explanation (`x`), typed hole fitting (`1`–`9`), editor invocation (`e`), and display detachment (`q`).
+  - Interactive key handler (`handleTuiKey`) supporting dynamic view switching (`g`/`m`/`z`), warning toggles (`t`), raw GHC toggles (`r`), row navigation (`↑`/`↓`), diagnostic inspection (`⏎`), error explanation (`x`), typed hole fitting (`1`–`9`), editor invocation (`e`), and display detachment (`q`).
+
+---
+
+## 7. Extended Workflow & Polish Enhancements (§12.6, §16, §17, §18, §19)
+
+- [x] **Interactive Raw GHC Message Toggle (`r`) (§12.6)**:
+  - Added `tsShowRawGhc` to `TuiState` and implemented key `r` in `handleTuiKey` and `interactiveInputLoop`.
+  - Enables instant toggling between formatted Tadka diagnostics and raw compiler diagnostic stream during live builds.
+  - Verified with QuickCheck Property 42.
+- [x] **GitHub Actions Annotations in CI Mode (`::error::` / `::warning::`) (§19)**:
+  - Enhanced `renderPlainViewCi` to emit standard workflow command annotations `::error file={file},line={line},col={col}::{msg}` and `::warning file={file},line={line},col={col}::{msg}` matching canonical visual mockup `07-plain-ci.png`.
+  - Verified with QuickCheck Property 43.
+- [x] **Specific Failed Target Rebuild Command in Summary Block (§16)**:
+  - Extended `renderSummaryBlock` to compute the exact minimal failed units (`failedUnits`) and emit an actionable rebuild command (`Next steps: Run 'buildr build <failed-units> --keep-going'`) when compilation errors occur.
+  - Verified with QuickCheck Property 44.
+- [x] **Configuration Persistence for `buildr theme use` (§17, §18)**:
+  - Updated `runTheme ["use", name]` to validate the theme name against `builtinThemes` and persist it directly to `./buildr.toml` for seamless project-wide configuration.
+- [x] **Comprehensive Environment Diagnostics in `buildr doctor` (§7, §8.3, §15, §18, §19)**:
+  - Added checks for `buildr-ghc` compiler wrapper on `PATH`.
+  - Added IPC transport abstraction detection (Windows Named Pipes vs Unix Domain Sockets).
+  - Added terminal dimensions and color support reporting (24-bit TrueColor, ANSI 16/256, NO_COLOR).
+  - Added VT sequence capability detection (OSC 8 Hyperlinks, OSC 9;4 Taskbar Progress, SGR 4:3 Undercurl).

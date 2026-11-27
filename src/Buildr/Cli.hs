@@ -97,7 +97,10 @@ import Buildr.History
   , saveHistoryCache
   )
 import Buildr.Ipc
-  ( startIpcServer
+  ( IpcTransportKind (..)
+  , detectIpcTransport
+  , resolveIpcPath
+  , startIpcServer
   , stopIpcServer
   )
 import Buildr.Model
@@ -158,6 +161,7 @@ import Control.Monad (filterM, forever, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC8
 import Data.Char (isDigit)
+import Data.List (intercalate, isPrefixOf)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -567,7 +571,7 @@ runCommand = \case
   CmdStats (StatsOpts maybeDir) -> runStats maybeDir
   CmdTheme (ThemeOpts subargs) -> runTheme subargs
 
--- | Environment diagnostic and compatibility validator per §7, §8.3, §15, and §18.
+-- | Environment diagnostic and compatibility validator per §7, §8.3, §15, §18, and §19.
 runDoctor :: IO ()
 runDoctor = do
   putStrLn "buildr doctor: running environment health check..."
@@ -590,7 +594,37 @@ runDoctor = do
     Just p  -> putStrLn ("  cabal-buildr:  available at " <> p <> " ('cabal buildr' ready)")
     Nothing -> putStrLn "  cabal-buildr:  not found on PATH (run 'cabal install' to enable 'cabal buildr')"
 
-  putStrLn "  Terminal:      VT escape sequences supported"
+  -- Check buildr-ghc transparent compiler wrapper on PATH (§8.1)
+  mBuildrGhc <- findExecutable "buildr-ghc"
+  case mBuildrGhc of
+    Just p  -> putStrLn ("  buildr-ghc:    available at " <> p <> " (compiler wrapper ready)")
+    Nothing -> putStrLn "  buildr-ghc:    not found on PATH (run 'cabal install' or put buildr-ghc on PATH)"
+
+  -- Check IPC transport abstraction (§7, §23, §24)
+  let sampleIpcPath = resolveIpcPath "health-check"
+      ipcTransport = detectIpcTransport sampleIpcPath
+      ipcDesc = case ipcTransport of
+        TransportWindowsNamedPipe -> "Windows Named Pipes (\\\\.\\pipe\\buildr-*)"
+        TransportUnixSocket       -> "Unix domain sockets (/tmp/buildr-*.sock)"
+  putStrLn ("  IPC transport: " <> ipcDesc)
+
+  -- Check Terminal Dimensions and VT Sequence Capabilities (§7, §19)
+  dims <- getTerminalDimensions
+  caps <- detectTerminalCaps
+  putStrLn ("  Terminal size: " <> show (tdCols dims) <> " cols x " <> show (tdRows dims) <> " rows")
+  let colorDesc = if tcTrueColor caps
+                    then "24-bit TrueColor"
+                    else if tcColorEnabled caps
+                      then "ANSI 16/256 color"
+                      else "monochrome (NO_COLOR set)"
+  putStrLn ("  Color support: " <> colorDesc)
+  let vtFeatures = filter (not . null)
+        [ if tcOsc8Hyperlinks caps then "OSC 8 Hyperlinks" else ""
+        , if tcOsc9Progress caps then "OSC 9;4 Taskbar Progress" else ""
+        , if tcUndercurl caps then "SGR 4:3 Undercurl" else ""
+        ]
+      vtDesc = if null vtFeatures then "standard ANSI escapes" else intercalate ", " vtFeatures
+  putStrLn ("  VT features:   " <> vtDesc)
   putStrLn "  Honesty check: 100% data trace verified"
 
   -- §15 hinsight exact version gate verification
@@ -707,7 +741,7 @@ runBuild (BuildOpts viewMode errStyle keepGoing explainHoles jsonSink recordFile
               isTty <- hIsTerminalDevice stdin
               initDims <- getTerminalDimensions
               caps <- detectTerminalCaps
-              tuiVar <- newMVar (TuiState viewMode True 0 False initDims)
+              tuiVar <- newMVar (defaultTuiState initDims viewMode)
 
               -- Guarantee terminal restoration under all exit paths (§20)
               withTerminalRestored (isTty && viewMode /= ViewPlain) $
@@ -862,6 +896,7 @@ onIpcEvent modelVar cacheVar maybeLogPath maybeJsonPath explainHoles ev = do
 data TuiState = TuiState
   { tsViewMode     :: !ViewMode
   , tsShowWarnings :: !Bool
+  , tsShowRawGhc   :: !Bool
   , tsSelectedRow  :: !Int
   , tsDetached     :: !Bool
   , tsDimensions   :: !TerminalDimensions
@@ -872,6 +907,7 @@ defaultTuiState :: TerminalDimensions -> ViewMode -> TuiState
 defaultTuiState dims mode = TuiState
   { tsViewMode     = mode
   , tsShowWarnings = True
+  , tsShowRawGhc   = False
   , tsSelectedRow  = 0
   , tsDetached     = False
   , tsDimensions   = dims
@@ -893,6 +929,7 @@ handleTuiKey ev s = case ev of
   KeyChar 'm' -> s { tsViewMode = ViewMosaic }
   KeyChar 'z' -> s { tsViewMode = ViewZen }
   KeyChar 't' -> s { tsShowWarnings = not (tsShowWarnings s) }
+  KeyChar 'r' -> s { tsShowRawGhc = not (tsShowRawGhc s) }
   KeyUp       -> s { tsSelectedRow = max 0 (tsSelectedRow s - 1) }
   KeyDown     -> s { tsSelectedRow = tsSelectedRow s + 1 }
   KeyChar 'q' -> s { tsDetached = True }
@@ -949,6 +986,14 @@ interactiveInputLoop tuiVar modelVar = forever $ do
       KeyChar 'm' -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 'm') s))
       KeyChar 'z' -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 'z') s))
       KeyChar 't' -> modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 't') s))
+      KeyChar 'r' -> do
+        modifyMVar_ tuiVar (\s -> pure (handleTuiKey (KeyChar 'r') s))
+        s <- readMVar tuiVar
+        let msg = if tsShowRawGhc s
+                    then "\nbuildr: raw compiler messages enabled (press 'r' to return to Tadka formatting)\n"
+                    else "\nbuildr: formatted Tadka diagnostics restored\n"
+        putStr msg
+        hFlush stdout
       KeyEnter    -> do
         s <- readMVar tuiVar
         m <- readMVar modelVar
@@ -1113,6 +1158,18 @@ runTheme = \case
   ("check":[]) ->
     runTheme ["check", "rasika"]
   ("use":name:_) ->
-    putStrLn ("Active theme set to: " <> name)
+    case getThemeByName (T.pack name) of
+      Just _ -> do
+        let projectConfPath = "buildr.toml"
+        exists <- doesFileExist projectConfPath
+        if exists
+          then do
+            content <- readFile projectConfPath
+            let newLines = filter (not . isPrefixOf "theme =") (lines content)
+                updatedContent = unlines (newLines ++ ["theme = \"" <> name <> "\""])
+            writeFile projectConfPath updatedContent
+          else writeFile projectConfPath ("# buildr project configuration\ntheme = \"" <> name <> "\"\n")
+        putStrLn ("Active theme set to: " <> name <> " (persisted to " <> projectConfPath <> ")")
+      Nothing -> putStrLn ("Unknown theme: " <> name <> ". Available themes: rasika, solarized-dark, monokai, high-contrast, linear-accessible")
   (other:_) ->
     putStrLn ("Unknown theme command: " <> other <> ". Use 'list', 'preview', 'check', or 'use'.")
