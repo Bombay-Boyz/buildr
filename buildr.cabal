@@ -47,6 +47,7 @@ common warnings
       ghc-options: -Werror
     default-language:   GHC2021
     default-extensions:
+      CPP
       StrictData
       BangPatterns
       LambdaCase
@@ -87,8 +88,9 @@ library
         process >=1.6 && <1.7,
         terminal-size >=0.3 && <0.4,
         text >=2.0 && <2.2,
-        time >=1.11 && <1.15,
-        unix >=2.8 && <2.9
+        time >=1.11 && <1.15
+    if !os(windows)
+        build-depends: unix >=2.8 && <2.9
 
 executable buildr
     import:           warnings
@@ -120,8 +122,9 @@ executable buildr-ghc
         network,
         process,
         text,
-        unix,
         time
+    if !os(windows)
+        build-depends: unix
 
 test-suite buildr-test
     import:           warnings
@@ -141,5 +144,6 @@ test-suite buildr-test
         terminal-size,
         QuickCheck >=2.14 && <2.20,
         text,
-        time,
-        unix
+        time
+    if !os(windows)
+        build-depends: unix

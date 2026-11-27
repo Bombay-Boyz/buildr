@@ -35,7 +35,9 @@ import System.Directory (canonicalizePath, doesDirectoryExist, doesFileExist, fi
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath ((</>))
+#if !defined(mingw32_HOST_OS)
 import System.Posix.Signals (sigTERM)
+#endif
 import System.Process (CreateProcess (..), createProcess, proc, readCreateProcessWithExitCode, readProcessWithExitCode, waitForProcess)
 import Test.QuickCheck
 
@@ -806,11 +808,15 @@ runSignalAndCancellationTests = do
   let deadProcOk = True
 
   -- 4. Process group signal delivery on active child
+#if !defined(mingw32_HOST_OS)
   let childProc = (proc "sleep" ["10"]) { create_group = True }
   (_, _, _, phSleep) <- createProcess childProc
   forwardSignalToProcessGroup sigTERM phSleep
   sleepExit <- waitForProcess phSleep
   let signalDeliveredOk = sleepExit /= ExitSuccess
+#else
+  let signalDeliveredOk = True
+#endif
 
   -- 5. Terminal restoration under thrown exception
   exRes <- try (withTerminalRestored False (throwIO (userError "simulated abortion failure"))) :: IO (Either SomeException ())

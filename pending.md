@@ -75,6 +75,7 @@ This document tracks implementation items, architectural enhancements, and bench
   - Cross-platform IPC transport abstraction supporting Windows Named Pipes (`\\.\pipe\buildr-...`) alongside Unix domain sockets.
   - Integrated Windows Job Object and process tree termination abstraction (`terminateProcessTree`).
   - Windows Console API virtual terminal sequence initialization (`enableVirtualTerminalProcessing`).
+  - Added Windows (`windows-latest`) to GitHub Actions CI ([`.github/workflows/ci.yml`](file:///Users/air/Documents/seby/projects/Haskell/buildr/.github/workflows/ci.yml)) test matrix with conditional `unix` dependencies.
 - [x] **Editor Protocol & Upstream Proposal**:
   - Defined editor/LSP 3.17 event consumer interface (`Buildr.Editor`) translating Event Protocol v1 into standard diagnostics and `$/progress` notifications.
   - Authored upstream RFC proposal for `cabal-install` native machine-readable event streaming ([`docs/cabal-upstream-proposal.md`](file:///Users/air/Documents/seby/projects/Haskell/buildr/docs/cabal-upstream-proposal.md)).
